@@ -903,6 +903,13 @@ try_cross_linking:;
 					// This points the linker to where the entry point is
 					link_settings = gb_string_appendc(link_settings, "-e _main ");
 				}
+
+				if (build_context.tilde_backend) {
+					// The Tilde (TB) backend only emits x86-64 machine code. On Apple
+					// Silicon the host clang would otherwise default to arm64 and
+					// reject the object file; the resulting binary runs under Rosetta 2.
+					link_settings = gb_string_appendc(link_settings, "-arch x86_64 ");
+				}
 			} else if (build_context.metrics.os == TargetOs_freebsd) {
 				if (build_context.sanitizer_flags & (SanitizerFlag_Address | SanitizerFlag_Memory)) {
 					// It's imperative that `pthread` is linked before `libc`,

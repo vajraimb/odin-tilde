@@ -4968,7 +4968,7 @@ gb_internal i64 type_offset_of(Type *t, i64 index, Type **field_type_) {
 		}
 		break;
 	}
-	GB_ASSERT(index == 0);
+	GB_ASSERT_MSG(index == 0, "type_offset_of: bad index %lld for type %s (kind %d)", cast(long long)index, type_to_string(t), cast(int)t->kind);
 	return 0;
 }
 

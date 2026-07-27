@@ -619,6 +619,8 @@ struct BuildContext {
 
 	isize max_error_count;
 
+	bool tilde_backend;
+
 	bool bedrock;
 	bool disable_non_constant_globals;
 	bool disable_init_fini;

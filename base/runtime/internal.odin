@@ -17,7 +17,8 @@ RUNTIME_REQUIRE :: false // !ODIN_TILDE
 @(private)
 __float16 :: f16 when __ODIN_LLVM_F16_SUPPORTED else u16
 
-HAS_HARDWARE_SIMD :: false when (ODIN_ARCH == .amd64 || ODIN_ARCH == .i386) && !intrinsics.has_target_feature("sse2") else
+HAS_HARDWARE_SIMD :: false when ODIN_TILDE else
+	false when (ODIN_ARCH == .amd64 || ODIN_ARCH == .i386) && !intrinsics.has_target_feature("sse2") else
 	false when (ODIN_ARCH == .arm64 || ODIN_ARCH == .arm32) && !intrinsics.has_target_feature("neon") else
 	false when (ODIN_ARCH == .wasm64p32 || ODIN_ARCH == .wasm32) && !intrinsics.has_target_feature("simd128") else
 	false when (ODIN_ARCH == .riscv64) && !intrinsics.has_target_feature("v") else
@@ -299,13 +300,15 @@ memory_equal :: proc "contextless" (x, y: rawptr, n: int) -> bool {
 			}
 		}
 
-		m = (n-i) / 16 * 16
-		for /**/; i < m; i += 16 {
-			load_a := intrinsics.unaligned_load(cast(^#simd[16]u8)&a[i])
-			load_b := intrinsics.unaligned_load(cast(^#simd[16]u8)&b[i])
-			ne := intrinsics.simd_lanes_ne(load_a, load_b)
-			if intrinsics.simd_reduce_or(ne) != 0 {
-				return false
+		when HAS_HARDWARE_SIMD {
+			m = (n-i) / 16 * 16
+			for /**/; i < m; i += 16 {
+				load_a := intrinsics.unaligned_load(cast(^#simd[16]u8)&a[i])
+				load_b := intrinsics.unaligned_load(cast(^#simd[16]u8)&b[i])
+				ne := intrinsics.simd_lanes_ne(load_a, load_b)
+				if intrinsics.simd_reduce_or(ne) != 0 {
+					return false
+				}
 			}
 		}
 
@@ -355,33 +358,35 @@ memory_compare :: proc "contextless" (x, y: rawptr, n: int) -> int #no_bounds_ch
 		}
 	}
 
-	m = (n-i) / 16 * 16
-	for /**/; i < m; i += 16 {
-		load_a := intrinsics.unaligned_load(cast(^#simd[16]u8)&a[i])
-		load_b := intrinsics.unaligned_load(cast(^#simd[16]u8)&b[i])
-		comparison := intrinsics.simd_lanes_ne(load_a, load_b)
-		if intrinsics.simd_reduce_or(comparison) != 0 {
-			sentinel: #simd[16]u8 = u8(0xFF)
-			indices := intrinsics.simd_indices(#simd[16]u8)
-			index_select := intrinsics.simd_select(comparison, indices, sentinel)
-			index_reduce := cast(uint)intrinsics.simd_reduce_min(index_select)
-			return -1 if a[i+index_reduce] < b[i+index_reduce] else +1
+	when HAS_HARDWARE_SIMD {
+		m = (n-i) / 16 * 16
+		for /**/; i < m; i += 16 {
+			load_a := intrinsics.unaligned_load(cast(^#simd[16]u8)&a[i])
+			load_b := intrinsics.unaligned_load(cast(^#simd[16]u8)&b[i])
+			comparison := intrinsics.simd_lanes_ne(load_a, load_b)
+			if intrinsics.simd_reduce_or(comparison) != 0 {
+				sentinel: #simd[16]u8 = u8(0xFF)
+				indices := intrinsics.simd_indices(#simd[16]u8)
+				index_select := intrinsics.simd_select(comparison, indices, sentinel)
+				index_reduce := cast(uint)intrinsics.simd_reduce_min(index_select)
+				return -1 if a[i+index_reduce] < b[i+index_reduce] else +1
+			}
 		}
-	}
 
-	// 64-bit SIMD is faster than using a `uintptr` to detect a difference then
-	// re-iterating with the byte-by-byte loop, at least on AMD64.
-	m = (n-i) / 8 * 8
-	for /**/; i < m; i += 8 {
-		load_a := intrinsics.unaligned_load(cast(^#simd[8]u8)&a[i])
-		load_b := intrinsics.unaligned_load(cast(^#simd[8]u8)&b[i])
-		comparison := intrinsics.simd_lanes_ne(load_a, load_b)
-		if intrinsics.simd_reduce_or(comparison) != 0 {
-			sentinel: #simd[8]u8 = u8(0xFF)
-			indices := intrinsics.simd_indices(#simd[8]u8)
-			index_select := intrinsics.simd_select(comparison, indices, sentinel)
-			index_reduce := cast(uint)intrinsics.simd_reduce_min(index_select)
-			return -1 if a[i+index_reduce] < b[i+index_reduce] else +1
+		// 64-bit SIMD is faster than using a `uintptr` to detect a difference then
+		// re-iterating with the byte-by-byte loop, at least on AMD64.
+		m = (n-i) / 8 * 8
+		for /**/; i < m; i += 8 {
+			load_a := intrinsics.unaligned_load(cast(^#simd[8]u8)&a[i])
+			load_b := intrinsics.unaligned_load(cast(^#simd[8]u8)&b[i])
+			comparison := intrinsics.simd_lanes_ne(load_a, load_b)
+			if intrinsics.simd_reduce_or(comparison) != 0 {
+				sentinel: #simd[8]u8 = u8(0xFF)
+				indices := intrinsics.simd_indices(#simd[8]u8)
+				index_select := intrinsics.simd_select(comparison, indices, sentinel)
+				index_reduce := cast(uint)intrinsics.simd_reduce_min(index_select)
+				return -1 if a[i+index_reduce] < b[i+index_reduce] else +1
+			}
 		}
 	}
 
@@ -420,13 +425,15 @@ memory_compare_zero :: proc "contextless" (a: rawptr, n: int) -> int #no_bounds_
 			}
 		}
 
-		scanner16: #simd[16]u8
-		m = (n-i) / 16 * 16
-		for /**/; i < m; i += 16 {
-			load := intrinsics.unaligned_load(cast(^#simd[16]u8)&bytes[i])
-			ne := intrinsics.simd_lanes_ne(scanner16, load)
-			if intrinsics.simd_reduce_or(ne) != 0 {
-				return 1
+		when HAS_HARDWARE_SIMD {
+			scanner16: #simd[16]u8
+			m = (n-i) / 16 * 16
+			for /**/; i < m; i += 16 {
+				load := intrinsics.unaligned_load(cast(^#simd[16]u8)&bytes[i])
+				ne := intrinsics.simd_lanes_ne(scanner16, load)
+				if intrinsics.simd_reduce_or(ne) != 0 {
+					return 1
+				}
 			}
 		}
 
@@ -476,33 +483,35 @@ memory_prefix_length :: proc "contextless" (x, y: rawptr, n: int) -> (idx: int) 
 		}
 	}
 
-	m = (n-i) / 16 * 16
-	for /**/; i < m; i += 16 {
-		load_a := intrinsics.unaligned_load(cast(^#simd[16]u8)&a[i])
-		load_b := intrinsics.unaligned_load(cast(^#simd[16]u8)&b[i])
-		comparison := intrinsics.simd_lanes_ne(load_a, load_b)
-		if intrinsics.simd_reduce_or(comparison) != 0 {
-			sentinel: #simd[16]u8 = u8(0xFF)
-			indices := intrinsics.simd_indices(#simd[16]u8)
-			index_select := intrinsics.simd_select(comparison, indices, sentinel)
-			index_reduce := cast(uint)intrinsics.simd_reduce_min(index_select)
-			return int(i + index_reduce)
+	when HAS_HARDWARE_SIMD {
+		m = (n-i) / 16 * 16
+		for /**/; i < m; i += 16 {
+			load_a := intrinsics.unaligned_load(cast(^#simd[16]u8)&a[i])
+			load_b := intrinsics.unaligned_load(cast(^#simd[16]u8)&b[i])
+			comparison := intrinsics.simd_lanes_ne(load_a, load_b)
+			if intrinsics.simd_reduce_or(comparison) != 0 {
+				sentinel: #simd[16]u8 = u8(0xFF)
+				indices := intrinsics.simd_indices(#simd[16]u8)
+				index_select := intrinsics.simd_select(comparison, indices, sentinel)
+				index_reduce := cast(uint)intrinsics.simd_reduce_min(index_select)
+				return int(i + index_reduce)
+			}
 		}
-	}
 
-	// 64-bit SIMD is faster than using a `uintptr` to detect a difference then
-	// re-iterating with the byte-by-byte loop, at least on AMD64.
-	m = (n-i) / 8 * 8
-	for /**/; i < m; i += 8 {
-		load_a := intrinsics.unaligned_load(cast(^#simd[8]u8)&a[i])
-		load_b := intrinsics.unaligned_load(cast(^#simd[8]u8)&b[i])
-		comparison := intrinsics.simd_lanes_ne(load_a, load_b)
-		if intrinsics.simd_reduce_or(comparison) != 0 {
-			sentinel: #simd[8]u8 = u8(0xFF)
-			indices := intrinsics.simd_indices(#simd[8]u8)
-			index_select := intrinsics.simd_select(comparison, indices, sentinel)
-			index_reduce := cast(uint)intrinsics.simd_reduce_min(index_select)
-			return int(i + index_reduce)
+		// 64-bit SIMD is faster than using a `uintptr` to detect a difference then
+		// re-iterating with the byte-by-byte loop, at least on AMD64.
+		m = (n-i) / 8 * 8
+		for /**/; i < m; i += 8 {
+			load_a := intrinsics.unaligned_load(cast(^#simd[8]u8)&a[i])
+			load_b := intrinsics.unaligned_load(cast(^#simd[8]u8)&b[i])
+			comparison := intrinsics.simd_lanes_ne(load_a, load_b)
+			if intrinsics.simd_reduce_or(comparison) != 0 {
+				sentinel: #simd[8]u8 = u8(0xFF)
+				indices := intrinsics.simd_indices(#simd[8]u8)
+				index_select := intrinsics.simd_select(comparison, indices, sentinel)
+				index_reduce := cast(uint)intrinsics.simd_reduce_min(index_select)
+				return int(i + index_reduce)
+			}
 		}
 	}
 
