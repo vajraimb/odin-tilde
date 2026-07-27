@@ -1,0 +1,755 @@
+#+build windows
+package sys_windows
+
+import "base:runtime"
+import "base:intrinsics"
+
+L :: intrinsics.constant_utf16_cstring
+
+// https://learn.microsoft.com/en-us/windows/win32/winmsg/makeword
+@(require_results)
+MAKEWORD :: #force_inline proc "contextless" (#any_int a, b: int) -> WORD {
+	return WORD(BYTE(DWORD_PTR(a) & 0xff)) | (WORD(BYTE(DWORD_PTR(b) & 0xff)) << 8)
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/winmsg/makelong
+@(require_results)
+MAKELONG :: #force_inline proc "contextless" (#any_int a, b: int) -> LONG {
+	return LONG(WORD(DWORD_PTR(a) & 0xffff)) | (LONG(WORD(DWORD_PTR(b) & 0xffff)) << 16)
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/winmsg/loword
+@(require_results)
+LOWORD :: #force_inline proc "contextless" (#any_int x: int) -> WORD {
+	return WORD(x & 0xffff)
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/winmsg/hiword
+@(require_results)
+HIWORD :: #force_inline proc "contextless" (#any_int x: int) -> WORD {
+	return WORD(x >> 16)
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/winmsg/lobyte
+@(require_results)
+LOBYTE :: #force_inline proc "contextless" (w: WORD) -> BYTE {
+	return BYTE((DWORD_PTR(w)) & 0xff)
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/winmsg/hibyte
+@(require_results)
+HIBYTE :: #force_inline proc "contextless" (w: WORD) -> BYTE {
+	return BYTE(((DWORD_PTR(w)) >> 8) & 0xff)
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-makewparam
+@(require_results)
+MAKEWPARAM :: #force_inline proc "contextless" (#any_int l, h: int) -> WPARAM {
+	return WPARAM(MAKELONG(l, h))
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-makelparam
+@(require_results)
+MAKELPARAM :: #force_inline proc "contextless" (#any_int l, h: int) -> LPARAM {
+	return LPARAM(MAKELONG(l, h))
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-makelresult
+@(require_results)
+MAKELRESULT :: #force_inline proc "contextless" (#any_int l, h: int) -> LRESULT {
+	return LRESULT(MAKELONG(l, h))
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/windowsx/nf-windowsx-get_x_lparam
+@(require_results)
+GET_X_LPARAM :: #force_inline proc "contextless" (lp: LPARAM) -> c_int {
+	return cast(c_int)cast(c_short)LOWORD(cast(DWORD)lp)
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/windowsx/nf-windowsx-get_y_lparam
+@(require_results)
+GET_Y_LPARAM :: #force_inline proc "contextless" (lp: LPARAM) -> c_int {
+	return cast(c_int)cast(c_short)HIWORD(cast(DWORD)lp)
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-makelcid
+@(require_results)
+MAKELCID :: #force_inline proc "contextless" (lgid, srtid: WORD) -> LCID {
+	return (DWORD(WORD(srtid)) << 16) | DWORD(WORD(lgid))
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-makelangid
+@(require_results)
+MAKELANGID :: #force_inline proc "contextless" (p, s: WORD) -> DWORD {
+	return DWORD(WORD(s)) << 10 | DWORD(WORD(p))
+}
+
+@(require_results)
+LANGIDFROMLCID :: #force_inline proc "contextless" (lcid: LCID) -> LANGID {
+	return LANGID(lcid)
+}
+
+@(require_results)
+utf8_to_utf16_alloc :: proc(s: string, allocator := context.temp_allocator) -> []u16 {
+	s_length := len(s)
+	if s_length < 1 {
+		return nil
+	}
+	if s_length > cast(int)max(c_int) {
+		// Unsupported (input string is excessively long).
+		return nil
+	}
+
+	b := transmute([]byte)s
+	cstr := raw_data(b)
+	n := MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, cstr, c_int(s_length), nil, 0)
+	if n <= 0 || cast(int)n >= max(int) {
+		// If n is equal to or greater than max(int), then we will not be able
+		// to create a big enough slice with the null terminator.
+		// NOTE: This only affects 32-bit systems and is purely pedantic because
+		//       the system will never be able to allocate that much memory.
+		return nil
+	}
+
+	text := make([]u16, cast(int)n + 1, allocator)
+	if text == nil {
+		return nil
+	}
+
+	n1 := MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, cstr, c_int(s_length), raw_data(text), n)
+	if n1 <= 0 {
+		delete(text, allocator)
+		return nil
+	}
+
+	// null-terminate the result here, even though the null element is not
+	// part of the slice. This is done to prevent callers which relied on
+	// this behavior, and is also expected by utf8_to_wstring_alloc.
+	text[n] = 0
+	return text[:n]
+}
+
+@(require_results)
+utf8_to_utf16_buf :: proc(buf: []u16, s: string) -> []u16 {
+	buf_length := len(buf)
+	if buf_length < 1 {
+		return nil
+	}
+	s_length := len(s)
+	if s_length == 0 {
+		return nil
+	}
+	if s_length > cast(int)max(c_int) {
+		// Unsupported (input string is excessively long).
+		return nil
+	}
+	if buf_length > cast(int)max(c_int) {
+		buf_length = cast(int)max(c_int)
+	}
+	elements_written := MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw_data(s), c_int(s_length), raw_data(buf), cast(c_int)buf_length)
+	if elements_written <= 0 {
+		// Insufficient buffer size, empty input string, or invalid characters. Contents of the buffer may have been modified.
+		return nil
+	}
+
+	// To be consistent with utf8_to_utf16_alloc, the output string
+	// is null-terminated here in the buffer, even though the terminating null character
+	// is not part of the returned slice.
+	if buf_length <= cast(int)elements_written {
+		// The terminating null character does not fit.
+		// Need at least a length of (elements_written+1).
+		return nil
+	}
+	buf[elements_written] = 0
+	return buf[:elements_written]
+}
+
+// Converts a regular UTF-8 `string` to UTF-16.
+//
+// The conversion includes any null characters present in the input string.
+//
+// Returns `nil` on conversion failure.
+//
+// Conversion may fail due to an invalid byte sequence in the input string,
+// or an insufficient buffer size (`utf8_to_utf16_buf` only),
+// or allocation failure (`utf8_to_utf16_alloc` only).
+//
+// The result of converting an empty string is indistinguishable from conversion failure.
+utf8_to_utf16 :: proc{utf8_to_utf16_alloc, utf8_to_utf16_buf}
+
+@(require_results)
+utf8_to_wstring_alloc :: proc(s: string, allocator := context.temp_allocator) -> wstring {
+	if len(s) == 0 {
+		// Empty string. Needs special care because an empty string
+		// is different from conversion failure.
+		buf := make([]u16, 1, allocator)
+		if buf == nil {
+			return nil
+		}
+		buf[0] = 0
+		return wstring(raw_data(buf))
+	}
+	// utf8_to_utf16 null-terminates the result in the allocated memory block,
+	// however, the null character is not part of the returned slice (it is just beyond).
+	// The conversion to wstring will bypass this implicit overrun.
+	res := utf8_to_utf16(s, allocator)
+	if len(res) > 0 {
+		return wstring(raw_data(res))
+	} else {
+		// Conversion failure.
+		return nil
+	}
+}
+
+@(require_results)
+utf8_to_wstring_buf :: proc(buf: []u16, s: string) -> wstring {
+	buf_length := len(buf)
+	if buf_length == 0 {
+		// Insufficient buffer size, even for an empty string.
+		return nil
+	}
+	if len(s) == 0 {
+		// Empty string. Needs special care because an empty string
+		// is different from conversion failure.
+		buf[0] = 0
+		return wstring(raw_data(buf))
+	}
+	// utf8_to_utf16 null-terminates the result in the buffer,
+	// however, the null character is not part of the returned slice (it is just beyond).
+	// The conversion to wstring will bypass this implicit overrun.
+	res := utf8_to_utf16(buf[:], s)
+	if len(res) > 0 {
+		return wstring(raw_data(res))
+	} else {
+		// Conversion failure.
+		return nil
+	}
+}
+
+// Converts a regular UTF-8 `string` to UTF-16, and returns the result as a
+// null-terminated `wstring`, or `nil` on conversion failure.
+//
+// Conversion may fail due to an invalid byte sequence in the input string,
+// or an insufficient buffer size (`utf8_to_wstring_buf` only),
+// or allocation failure (`utf8_to_wstring_alloc` only).
+//
+// An empty string is valid, and results in a value distinct from `nil`.
+utf8_to_wstring :: proc{utf8_to_wstring_alloc, utf8_to_wstring_buf}
+
+@(require_results)
+wstring_to_utf8_alloc :: proc(s: wstring, N: int, allocator := context.temp_allocator) -> (res: string, err: runtime.Allocator_Error) {
+	context.allocator = allocator
+
+	if N == 0 {
+		return
+	}
+
+	n := WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s, c_int(N) if N > 0 else -1, nil, 0, nil, nil)
+	if n == 0 {
+		return
+	}
+
+	// If N < 0 the call to WideCharToMultiByte assume the wide string is null terminated
+	// and will scan it to find the first null terminated character. The resulting string will
+	// also be null terminated.
+	// If N > 0 it assumes the wide string is not null terminated and the resulting string
+	// will not be null terminated.
+	text := make([]byte, n) or_return
+
+	n1 := WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s, c_int(N), raw_data(text), n, nil, nil)
+	if n1 == 0 {
+		delete(text, allocator)
+		return
+	}
+
+	for i in 0..<n {
+		if text[i] == 0 {
+			n = i
+			break
+		}
+	}
+	return string(text[:n]), nil
+}
+
+@(require_results)
+wstring_to_utf8_buf :: proc(buf: []u8, s: wstring, N := -1) -> (res: string) {
+	n := WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s, c_int(N), nil, 0, nil, nil)
+	if n == 0 {
+		return
+	} else if int(n) > len(buf) {
+		return
+	}
+
+	n2 := WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s, c_int(N), raw_data(buf), n, nil, nil)
+	if n2 == 0 {
+		return
+	} else if int(n2) > len(buf) {
+		return
+	}
+
+	for i in 0..<n2 {
+		if buf[i] == 0 {
+			n2 = i
+			break
+		}
+	}
+	return string(buf[:n2])
+}
+
+wstring_to_utf8 :: proc{wstring_to_utf8_alloc, wstring_to_utf8_buf}
+
+/*
+Converts a UTF-16 string into a regular UTF-8 `string` and allocates the result.
+If the input is null-terminated, only the part of the input string leading up
+to it will be converted.
+
+*Allocates Using Provided Allocator*
+
+Inputs:
+- s: The string to be converted
+- allocator: (default: context.allocator)
+
+Returns:
+- res: A cloned and converted string
+- err: An optional allocator error if one occured, `nil` otherwise
+*/
+@(require_results)
+utf16_to_utf8_alloc :: proc(s: []u16, allocator := context.temp_allocator) -> (res: string, err: runtime.Allocator_Error) {
+	if len(s) == 0 {
+		return "", nil
+	}
+	return wstring_to_utf8(wstring(raw_data(s)), len(s), allocator)
+}
+
+/*
+Converts a UTF-16 string into a regular UTF-8 `string`, using `buf` as its backing.
+If the input is null-terminated, only the part of the input string leading up
+to it will be converted.
+
+*Uses `buf` for backing*
+
+Inputs:
+- s: The string to be converted
+- buf: Backing buffer for result string
+
+Returns:
+- res: A converted string, backed byu `buf`
+*/
+@(require_results)
+utf16_to_utf8_buf :: proc(buf: []u8, s: []u16) -> (res: string) {
+	if len(s) == 0 {
+		return
+	}
+	return wstring_to_utf8(buf, wstring(raw_data(s)), len(s))
+}
+
+utf16_to_utf8 :: proc{utf16_to_utf8_alloc, utf16_to_utf8_buf}
+
+
+// AdvAPI32, NetAPI32 and UserENV helpers.
+
+@(require_results)
+allowed_username :: proc "contextless" (username: string) -> bool {
+	contains_any :: proc "contextless" (s, chars: string) -> bool {
+		if chars == "" {
+			return false
+		}
+		for c in transmute([]byte)s {
+			for b in transmute([]byte)chars {
+				if c == b {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+/*
+	User account names are limited to 20 characters and group names are limited to 256 characters.
+	In addition, account names cannot be terminated by a period and they cannot include commas or any of the following printable characters:
+	", /, , [, ], :, |, <, >, +, =, ;, ?, *. Names also cannot include characters in the range 1-31, which are nonprintable.
+*/
+
+	_DISALLOWED :: "\"/ []:|<>+=;?*,"
+
+	if len(username) > LM20_UNLEN || len(username) == 0 {
+		return false
+	}
+	if username[len(username)-1] == '.' {
+		return false
+	}
+
+	for r in username {
+		if r > 0 && r < 32 {
+			return false
+		}
+	}
+	if contains_any(username, _DISALLOWED) {
+		return false
+	}
+
+	return true
+}
+
+// Returns .Success on success.
+@(require_results)
+_add_user :: proc(servername: string, username: string, password: string) -> (ok: NET_API_STATUS) {
+	servername_w: wstring
+	username_w:   []u16
+	password_w:   []u16
+
+	if len(servername) == 0 {
+		// Create account on this computer
+		servername_w = nil
+	} else {
+		server := utf8_to_utf16(servername, context.temp_allocator)
+		servername_w = wstring(&server[0])
+	}
+
+	if len(username) == 0 || len(username) > LM20_UNLEN {
+		return .BadUsername
+	}
+	if !allowed_username(username) {
+		return .BadUsername
+	}
+	if len(password) == 0 || len(password) > LM20_PWLEN {
+		return .BadPassword
+	}
+
+	username_w = utf8_to_utf16(username, context.temp_allocator)
+	password_w = utf8_to_utf16(password, context.temp_allocator)
+
+
+	level  := DWORD(1)
+	parm_err: DWORD
+
+	user_info := USER_INFO_1{
+		name         = &username_w[0],
+		password     = &password_w[0], // Max password length is defined in LM20_PWLEN.
+		password_age = 0,              // Ignored
+		priv         = .User,
+		home_dir     = nil,            // We'll set it later
+		comment      = nil,
+		flags        = {.Script, .Normal_Account},
+		script_path  = nil,
+	}
+
+	ok = NetUserAdd(
+		servername_w,
+		level,
+		&user_info,
+		&parm_err,
+	)
+
+	return
+}
+
+@(require_results)
+get_computer_name_and_account_sid :: proc(username: string) -> (computer_name: string, sid := SID{}, ok: bool) {
+	username_w := utf8_to_utf16(username, context.temp_allocator)
+	cbsid: DWORD
+	computer_name_size: DWORD
+	pe_use := SID_NAME_USE.SidTypeUser
+
+	res := LookupAccountNameW(
+		nil, // Look on this computer first
+		wstring(&username_w[0]),
+		&sid,
+		&cbsid,
+		nil,
+		&computer_name_size,
+		&pe_use,
+	)
+	if computer_name_size == 0 {
+		// User didn't exist, or we'd have a size here.
+		return "", {}, false
+	}
+
+	cname_w := make([]u16, computer_name_size, context.temp_allocator)
+
+	res = LookupAccountNameW(
+		nil,
+		wstring(&username_w[0]),
+		&sid,
+		&cbsid,
+		wstring(&cname_w[0]),
+		&computer_name_size,
+		&pe_use,
+	)
+
+	if !res {
+		return "", {}, false
+	}
+	computer_name = utf16_to_utf8(cname_w, context.temp_allocator) or_else ""
+
+	ok = true
+	return
+}
+
+@(require_results)
+get_sid :: proc(username: string, sid: ^SID) -> (ok: bool) {
+	username_w := utf8_to_utf16(username, context.temp_allocator)
+	cbsid: DWORD
+	computer_name_size: DWORD
+	pe_use := SID_NAME_USE.SidTypeUser
+
+	res := LookupAccountNameW(
+		nil, // Look on this computer first
+		wstring(&username_w[0]),
+		sid,
+		&cbsid,
+		nil,
+		&computer_name_size,
+		&pe_use,
+	)
+	if computer_name_size == 0 {
+		// User didn't exist, or we'd have a size here.
+		return false
+	}
+
+	cname_w := make([]u16, computer_name_size, context.temp_allocator)
+
+	res = LookupAccountNameW(
+		nil,
+		wstring(&username_w[0]),
+		sid,
+		&cbsid,
+		wstring(&cname_w[0]),
+		&computer_name_size,
+		&pe_use,
+	)
+
+	if !res {
+		return false
+	}
+	ok = true
+	return
+}
+
+add_user_to_group :: proc(sid: ^SID, group: string) -> (ok: NET_API_STATUS) {
+	group_member := LOCALGROUP_MEMBERS_INFO_0{
+		sid = sid,
+	}
+	group_name := utf8_to_utf16(group, context.temp_allocator)
+	ok = NetLocalGroupAddMembers(
+		nil,
+		wstring(&group_name[0]),
+		0,
+		&group_member,
+		1,
+	)
+	return
+}
+
+add_del_from_group :: proc(sid: ^SID, group: string) -> (ok: NET_API_STATUS) {
+	group_member := LOCALGROUP_MEMBERS_INFO_0{
+		sid = sid,
+	}
+	group_name := utf8_to_utf16(group, context.temp_allocator)
+	ok = NetLocalGroupDelMembers(
+		nil,
+		cstring16(&group_name[0]),
+		0,
+		&group_member,
+		1,
+	)
+	return
+}
+
+@(require_results)
+add_user_profile :: proc(username: string) -> (ok: bool, profile_path: string) {
+	username_w := utf8_to_utf16(username, context.temp_allocator)
+
+	sid := SID{}
+	ok = get_sid(username, &sid)
+	if ok == false {
+		return false, ""
+	}
+
+	sb: wstring
+	res := ConvertSidToStringSidW(&sid, &sb)
+	if res == false {
+		return false, ""
+	}
+	defer LocalFree(rawptr(sb))
+
+	pszProfilePath := make([]u16, 257, context.temp_allocator)
+	res2 := CreateProfile(
+		sb,
+		cstring16(&username_w[0]),
+		cstring16(&pszProfilePath[0]),
+		257,
+	)
+	if res2 != 0 {
+		return false, ""
+	}
+	profile_path = wstring_to_utf8(wstring(&pszProfilePath[0]), 257) or_else ""
+
+	return true, profile_path
+}
+
+
+delete_user_profile :: proc(username: string) -> (ok: bool) {
+	sid := SID{}
+	ok = get_sid(username, &sid)
+	if ok == false {
+		return false
+	}
+
+	sb: wstring
+	res := ConvertSidToStringSidW(&sid, &sb)
+	if res == false {
+		return false
+	}
+	defer LocalFree(rawptr(sb))
+
+	res2 := DeleteProfileW(
+		sb,
+		nil,
+		nil,
+	)
+	return bool(res2)
+}
+
+add_user :: proc(servername: string, username: string, password: string) -> (ok: bool) {
+	/*
+		Convenience function that creates a new user, adds it to the group Users and creates a profile directory for it.
+		Requires elevated privileges (run as administrator).
+
+		TODO: Add a bool that governs whether to delete the user if adding to group and/or creating profile fail?
+		TODO: SecureZeroMemory the password after use.
+	*/
+
+	res := _add_user(servername, username, password)
+	if res != .Success {
+		return false
+	}
+
+	// Grab the SID to add the user to the Users group.
+	sid: SID
+	ok2 := get_sid(username, &sid)
+	if ok2 == false {
+		return false
+	}
+
+	ok3 := add_user_to_group(&sid, "Users")
+	if ok3 != .Success {
+		return false
+	}
+
+	return true
+}
+
+delete_user :: proc(servername: string, username: string) -> (ok: bool) {
+	/*
+		Convenience function that deletes a user.
+		Requires elevated privileges (run as administrator).
+
+		TODO: Add a bool that governs whether to delete the profile from this wrapper?
+	*/
+
+	servername_w: wstring
+	if len(servername) == 0 {
+		// Delete account on this computer
+		servername_w = nil
+	} else {
+		server := utf8_to_utf16(servername, context.temp_allocator)
+		servername_w = wstring(&server[0])
+	}
+	username_w := utf8_to_utf16(username)
+
+	res := NetUserDel(
+		servername_w,
+		wstring(&username_w[0]),
+	)
+	if res != .Success {
+		return false
+	}
+	return true
+}
+
+run_as_user :: proc(username, password, application, commandline: string, pi: ^PROCESS_INFORMATION, wait := true) -> (ok: bool) {
+	/*
+		Needs to be run as an account which has the "Replace a process level token" privilege.
+		This can be added to an account from: Control Panel -> Administrative Tools -> Local Security Policy.
+		The path to this policy is as follows: Local Policies -> User Rights Assignment -> Replace a process level token.
+		A reboot may be required for this change to take effect and impersonating a user to work.
+
+		TODO: SecureZeroMemory the password after use.
+
+	*/
+
+	username_w    := utf8_to_utf16(username)
+	domain_w      := utf8_to_utf16(".")
+	password_w    := utf8_to_utf16(password)
+	app_w         := utf8_to_utf16(application)
+
+	commandline_w: []u16 = {0}
+	if len(commandline) > 0 {
+		commandline_w = utf8_to_utf16(commandline)
+	}
+
+	user_token: HANDLE
+
+	ok = bool(LogonUserW(
+		lpszUsername    = wstring(&username_w[0]),
+		lpszDomain      = wstring(&domain_w[0]),
+		lpszPassword    = wstring(&password_w[0]),
+		dwLogonType     = .NEW_CREDENTIALS,
+		dwLogonProvider = .WINNT50,
+		phToken         = &user_token,
+	))
+
+	if !ok {
+		return false
+		// err := GetLastError();
+		// fmt.printf("GetLastError: %v\n", err);
+	}
+	si := STARTUPINFOW{}
+	si.cb = size_of(STARTUPINFOW)
+
+	ok = bool(CreateProcessAsUserW(
+		user_token,
+		wstring(&app_w[0]),
+		wstring(&commandline_w[0]),
+		nil,	// lpProcessAttributes,
+		nil,	// lpThreadAttributes,
+		false,	// bInheritHandles,
+		0,		// creation flags
+		nil,	// environment,
+		nil,	// current directory: inherit from parent if nil
+		&si,
+		pi,
+	))
+	if ok {
+		if wait {
+			WaitForSingleObject(pi.hProcess, INFINITE)
+			CloseHandle(pi.hProcess)
+			CloseHandle(pi.hThread)
+		}
+		return true
+	} else {
+		return false
+	}
+}
+
+ensure_winsock_initialized :: proc "contextless" () {
+	@static gate := false
+	@static initted := false
+
+	if intrinsics.atomic_load(&initted) {
+		return
+	}
+
+	for intrinsics.atomic_compare_exchange_strong(&gate, false, true) {
+		intrinsics.cpu_relax()
+	}
+	defer intrinsics.atomic_store(&gate, false)
+
+	unused_info: WSADATA
+	version_requested := WORD(2) << 8 | 2
+	res := WSAStartup(version_requested, &unused_info)
+	assert_contextless(res == 0, "unable to initialized Winsock2")
+
+	intrinsics.atomic_store(&initted, true)
+}

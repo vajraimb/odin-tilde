@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -eu
+
+mkdir -p build
+pushd build
+ODIN=../../../odin
+COMMON="-define:ODIN_TEST_FANCY=false -file -vet -strict-style -ignore-unused-defineables"
+
+set -x
+
+$ODIN test ../test_issue_829.odin  $COMMON
+$ODIN test ../test_issue_1592.odin $COMMON
+$ODIN test ../test_issue_1730.odin $COMMON
+$ODIN test ../test_issue_2056.odin $COMMON
+$ODIN build ../test_issue_2113.odin $COMMON -debug
+$ODIN test ../test_issue_2466.odin $COMMON
+$ODIN test ../test_issue_2615.odin $COMMON
+$ODIN test ../test_issue_2637.odin $COMMON
+$ODIN test ../test_issue_2666.odin $COMMON
+$ODIN test ../test_issue_2694.odin $COMMON
+$ODIN test ../test_issue_3435.odin $COMMON
+$ODIN test ../test_issue_4210.odin $COMMON
+$ODIN test ../test_issue_4364.odin $COMMON
+$ODIN test ../test_issue_4584.odin $COMMON
+if [[ $($ODIN build ../test_issue_2395.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 2 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+$ODIN build ../test_issue_5043.odin $COMMON
+$ODIN build ../test_issue_5097.odin $COMMON
+$ODIN build ../test_issue_5097-2.odin $COMMON
+$ODIN build ../test_issue_5265.odin $COMMON
+$ODIN test ../test_issue_5699.odin $COMMON
+$ODIN test ../test_issue_6068.odin $COMMON
+$ODIN test ../test_issue_6101.odin $COMMON
+$ODIN test ../test_issue_6165.odin $COMMON
+$ODIN test ../test_issue_6344.odin $COMMON
+$ODIN test ../test_issue_6344.odin $COMMON -o:speed
+$ODIN test ../test_issue_6396.odin $COMMON
+$ODIN test ../test_pr_6476.odin $COMMON
+
+if [[ $($ODIN build ../test_issue_6240.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 3 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+if [[ $($ODIN build ../test_issue_6401.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 3 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+if [[ $($ODIN build ../test_issue_6594.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 1 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+if [[ $($ODIN build ../test_issue_6621.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 1 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+$ODIN test ../test_pr_6470.odin $COMMON
+if [[ $($ODIN test ../test_pr_6470.odin -define:TEST_EXPECT_FAILURE=true $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 1 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+$ODIN check ../test_issue_6484.odin -no-entry-point $COMMON
+if [[ $($ODIN check ../test_issue_6874.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 1 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+$ODIN check ../test_issue_6979.odin -no-entry-point $COMMON
+$ODIN build ../test_issue_7037.odin $COMMON -o:none
+
+
+clang -c ../test_issue_7010.c -o test_issue_7010_c.o
+$ODIN test ../test_issue_7010.odin $COMMON
+
+clang -c ../test_issue_6809_6816.c -o test_issue_6809_6816_c.o -O3
+$ODIN test ../test_issue_6809_6816.odin -o:speed $COMMON
+
+clang -c ../test_issue_5640.c -o test_issue_5640_c.o
+if [[ "$(uname)" != "NetBSD" ]]; then
+	$ODIN test ../test_issue_5640.odin -o:none --sanitize:address $COMMON
+else
+	$ODIN test ../test_issue_5640.odin -o:none $COMMON
+fi
+
+set +x
+
+popd
+rm -rf build

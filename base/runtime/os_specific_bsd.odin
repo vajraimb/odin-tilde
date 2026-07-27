@@ -1,0 +1,42 @@
+#+build freebsd, openbsd, netbsd
+#+private
+package runtime
+
+foreign import libc "system:c"
+
+_HAS_RAND_BYTES :: true
+
+@(default_calling_convention="c")
+foreign libc {
+	@(link_name="write")
+	_unix_write :: proc(fd: i32, buf: rawptr, size: int) -> int ---
+
+	when ODIN_OS == .NetBSD || ODIN_OS == .OpenBSD {
+		@(link_name="__errno") __error :: proc() -> ^i32 ---
+	} else {
+		__error :: proc() -> ^i32 ---
+	}
+
+	arc4random_buf :: proc(buf: [^]byte, nbytes: uint) ---
+}
+
+_stderr_write :: proc "contextless" (data: []byte) -> (int, _OS_Errno) {
+	ret := _unix_write(2, raw_data(data), len(data))
+	if ret < len(data) {
+		err := __error()
+		return int(ret), _OS_Errno(err^ if err != nil else 0)
+	}
+	return int(ret), 0
+}
+
+_rand_bytes :: proc "contextless" (dst: []byte) {
+	arc4random_buf(raw_data(dst), len(dst))
+}
+
+_exit :: proc "contextless" (code: int) -> ! {
+	@(default_calling_convention="c")
+	foreign libc {
+		exit :: proc(status: i32) -> ! ---
+	}
+	exit(i32(code))
+}
