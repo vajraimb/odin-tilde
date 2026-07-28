@@ -1,3 +1,21 @@
+// NOTE(odin-tilde): TB only has RELAXED/ACQ_REL/SEQ_CST; on x64 acquire,
+// release and acq_rel all lower identically, so they all map to ACQ_REL.
+// Values mirror OdinAtomicMemoryOrder in types.cpp:
+//   relaxed=0, consume=1, acquire=2, release=3, acq_rel=4, seq_cst=5
+gb_internal TB_MemoryOrder cg_tb_memory_order_from_odin(Ast *expr) {
+	ExactValue value = type_and_value_of_expr(expr).value;
+	GB_ASSERT(value.kind == ExactValue_Integer);
+	switch (exact_value_to_i64(value)) {
+	case 0: return TB_MEM_ORDER_RELAXED;
+	case 1:
+	case 2:
+	case 3:
+	case 4: return TB_MEM_ORDER_ACQ_REL;
+	case 5: return TB_MEM_ORDER_SEQ_CST;
+	}
+	return TB_MEM_ORDER_SEQ_CST;
+}
+
 gb_internal cgValue cg_builtin_len(cgProcedure *p, cgValue value) {
 	Type *t = base_type(value.type);
 
@@ -172,8 +190,19 @@ gb_internal cgValue cg_builtin_raw_data(cgProcedure *p, cgValue const &value) {
 		break;
 	case Type_Pointer:
 		GB_ASSERT(is_type_array_like(t->Pointer.elem));
-		GB_ASSERT(value.kind == cgValue_Value);
-		res = cg_value(value.node, alloc_type_multi_pointer(base_array_type(t->Pointer.elem)));
+		{
+			// NOTE(odin-tilde): arrays live in memory, so a ^[N]T value may
+			// arrive as cgValue_Addr (node IS the pointer value) or as
+			// cgValue_Symbol (a global, materialize its address here).
+			TB_Node *base = nullptr;
+			if (value.kind == cgValue_Symbol) {
+				base = tb_inst_get_symbol_address(p->func, value.symbol);
+			} else {
+				GB_ASSERT(value.kind == cgValue_Value || value.kind == cgValue_Addr);
+				base = value.node;
+			}
+			res = cg_value(base, alloc_type_multi_pointer(base_array_type(t->Pointer.elem)));
+		}
 		break;
 	case Type_MultiPointer:
 
@@ -614,6 +643,168 @@ gb_internal cgValue cg_build_builtin_simd_proc(cgProcedure *p, Ast *expr, Builti
 			}
 			return cg_addr_load(p, res);
 		}
+
+	// PATCH(odin-tilde): per-lane arithmetic/simd shifts (simd_add family)
+	case BuiltinProc_simd_add:
+	case BuiltinProc_simd_sub:
+	case BuiltinProc_simd_mul:
+	case BuiltinProc_simd_div:
+	case BuiltinProc_simd_shl:
+	case BuiltinProc_simd_shr:
+	case BuiltinProc_simd_shl_masked:
+	case BuiltinProc_simd_shr_masked:
+		{
+			cgValue x = cg_build_expr(p, ce->args[0]);
+			cgValue y = cg_build_expr(p, ce->args[1]);
+			Type *et = nullptr;
+			i64 count = 0;
+			cgValue xb = cg_simd_base_ptr(p, x, &et, &count);
+			cgValue yb = cg_simd_base_ptr(p, y, nullptr, nullptr);
+
+			bool is_float  = is_type_float(et);
+			bool is_signed = is_type_integer(et) && !is_type_unsigned(et);
+			TB_DataType edt = cg_data_type(et);
+			i64 bit_width = 8 * type_size_of(et);
+
+			cgAddr res = cg_add_local(p, result_type, nullptr, true);
+			cgValue rb = cg_value(cg_addr_get_ptr(p, res).node, alloc_type_pointer(et));
+
+			for (i64 i = 0; i < count; i++) {
+				TB_Node *idx = tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)i);
+				TB_Node *a = cg_simd_load_lane(p, xb, et, idx);
+				TB_Node *b = cg_simd_load_lane(p, yb, et, idx);
+				TB_Node *r = nullptr;
+				switch (id) {
+				case BuiltinProc_simd_add:
+					r = is_float ? tb_inst_fadd(p->func, a, b)
+					             : tb_inst_add(p->func, a, b, TB_ARITHMATIC_NONE);
+					break;
+				case BuiltinProc_simd_sub:
+					r = is_float ? tb_inst_fsub(p->func, a, b)
+					             : tb_inst_sub(p->func, a, b, TB_ARITHMATIC_NONE);
+					break;
+				case BuiltinProc_simd_mul:
+					r = is_float ? tb_inst_fmul(p->func, a, b)
+					             : tb_inst_mul(p->func, a, b, TB_ARITHMATIC_NONE);
+					break;
+				case BuiltinProc_simd_div:
+					r = is_float ? tb_inst_fdiv(p->func, a, b)
+					             : tb_inst_div(p->func, a, b, is_signed);
+					break;
+				case BuiltinProc_simd_shl:
+				case BuiltinProc_simd_shl_masked: {
+					TB_Node *amt = b;
+					if (id == BuiltinProc_simd_shl_masked) {
+						amt = tb_inst_and(p->func, amt, tb_inst_uint(p->func, edt, cast(u64)(bit_width - 1)));
+					}
+					r = tb_inst_shl(p->func, a, amt, TB_ARITHMATIC_NONE);
+					break;
+				}
+				case BuiltinProc_simd_shr:
+				case BuiltinProc_simd_shr_masked: {
+					TB_Node *amt = b;
+					if (id == BuiltinProc_simd_shr_masked) {
+						amt = tb_inst_and(p->func, amt, tb_inst_uint(p->func, edt, cast(u64)(bit_width - 1)));
+					}
+					r = is_signed ? tb_inst_sar(p->func, a, amt)
+					              : tb_inst_shr(p->func, a, amt);
+					break;
+				}
+				}
+				GB_ASSERT(r != nullptr);
+				cgValue ep = cg_emit_ptr_offset(p, rb, cg_const_int(p, t_int, i));
+				cg_emit_store(p, ep, cg_value(r, et));
+			}
+			return cg_addr_load(p, res);
+		}
+
+	case BuiltinProc_simd_neg:
+		{
+			cgValue x = cg_build_expr(p, ce->args[0]);
+			Type *et = nullptr;
+			i64 count = 0;
+			cgValue xb = cg_simd_base_ptr(p, x, &et, &count);
+			bool is_float = is_type_float(et);
+			TB_DataType edt = cg_data_type(et);
+
+			cgAddr res = cg_add_local(p, result_type, nullptr, true);
+			cgValue rb = cg_value(cg_addr_get_ptr(p, res).node, alloc_type_pointer(et));
+
+			for (i64 i = 0; i < count; i++) {
+				TB_Node *idx = tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)i);
+				TB_Node *a = cg_simd_load_lane(p, xb, et, idx);
+				TB_Node *r = is_float ? tb_inst_neg(p->func, a)
+				                      : tb_inst_sub(p->func, tb_inst_uint(p->func, edt, 0), a, TB_ARITHMATIC_NONE);
+				cgValue ep = cg_emit_ptr_offset(p, rb, cg_const_int(p, t_int, i));
+				cg_emit_store(p, ep, cg_value(r, et));
+			}
+			return cg_addr_load(p, res);
+		}
+
+	// PATCH(odin-tilde): integer bitwise lane ops
+	case BuiltinProc_simd_bit_and:
+	case BuiltinProc_simd_bit_or:
+	case BuiltinProc_simd_bit_xor:
+	case BuiltinProc_simd_bit_and_not:
+		{
+			cgValue x = cg_build_expr(p, ce->args[0]);
+			cgValue y = cg_build_expr(p, ce->args[1]);
+			Type *et = nullptr;
+			i64 count = 0;
+			cgValue xb = cg_simd_base_ptr(p, x, &et, &count);
+			cgValue yb = cg_simd_base_ptr(p, y, nullptr, nullptr);
+
+			cgAddr res = cg_add_local(p, result_type, nullptr, true);
+			cgValue rb = cg_value(cg_addr_get_ptr(p, res).node, alloc_type_pointer(et));
+
+			for (i64 i = 0; i < count; i++) {
+				TB_Node *idx = tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)i);
+				TB_Node *a = cg_simd_load_lane(p, xb, et, idx);
+				TB_Node *b = cg_simd_load_lane(p, yb, et, idx);
+				TB_Node *r = nullptr;
+				switch (id) {
+				case BuiltinProc_simd_bit_and:     r = tb_inst_and(p->func, a, b); break;
+				case BuiltinProc_simd_bit_or:      r = tb_inst_or (p->func, a, b); break;
+				case BuiltinProc_simd_bit_xor:     r = tb_inst_xor(p->func, a, b); break;
+				case BuiltinProc_simd_bit_and_not: r = tb_inst_and(p->func, tb_inst_not(p->func, a), b); break;
+				}
+				GB_ASSERT(r != nullptr);
+				cgValue ep = cg_emit_ptr_offset(p, rb, cg_const_int(p, t_int, i));
+				cg_emit_store(p, ep, cg_value(r, et));
+			}
+			return cg_addr_load(p, res);
+		}
+
+	// PATCH(odin-tilde): compile-time shuffle (indices are constant args 2..)
+	case BuiltinProc_simd_shuffle:
+		{
+			cgValue x = cg_build_expr(p, ce->args[0]);
+			cgValue y = cg_build_expr(p, ce->args[1]);
+			Type *et = nullptr;
+			i64 count = 0;
+			cgValue xb = cg_simd_base_ptr(p, x, &et, &count);
+			cgValue yb = cg_simd_base_ptr(p, y, nullptr, nullptr);
+
+			i64 indices_count = ce->args.count - 2;
+			cgAddr res = cg_add_local(p, result_type, nullptr, true);
+			cgValue rb = cg_value(cg_addr_get_ptr(p, res).node, alloc_type_pointer(et));
+
+			for (i64 i = 0; i < indices_count; i++) {
+				TypeAndValue tav = type_and_value_of_expr(ce->args[i+2]);
+				GB_ASSERT(tav.value.kind == ExactValue_Integer);
+				i64 src = exact_value_to_i64(tav.value);
+				cgValue base = xb;
+				if (src >= count) {
+					base = yb;
+					src -= count;
+				}
+				TB_Node *idx = tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)src);
+				TB_Node *lane = cg_simd_load_lane(p, base, et, idx);
+				cgValue ep = cg_emit_ptr_offset(p, rb, cg_const_int(p, t_int, i));
+				cg_emit_store(p, ep, cg_value(lane, et));
+			}
+			return cg_addr_load(p, res);
+		}
 	}
 
 	GB_PANIC("TODO(bill): unhandled #simd builtin %s for tilde backend", builtin_procs[id].name);
@@ -775,6 +966,17 @@ gb_internal cgValue cg_build_builtin(cgProcedure *p, BuiltinProcId id, Ast *expr
 			return cg_builtin_mem_zero(p, ptr, len);
 		}
 
+	case BuiltinProc_mem_zero_volatile:
+		{
+			// NOTE(odin-tilde): volatile variant of mem_zero
+			cgValue ptr = cg_build_expr(p, ce->args[0]);
+			cgValue len = cg_build_expr(p, ce->args[1]);
+			GB_ASSERT(ptr.kind == cgValue_Value);
+			GB_ASSERT(len.kind == cgValue_Value);
+			tb_builder_memzero(cg_tb_g(p->func), 0, true, ptr.node, len.node, 1, true);
+			return ptr;
+		}
+
 	case BuiltinProc_mem_copy:
 		{
 			cgValue dst = cg_build_expr(p, ce->args[0]);
@@ -860,6 +1062,142 @@ gb_internal cgValue cg_build_builtin(cgProcedure *p, BuiltinProcId id, Ast *expr
 				tb_inst_memcpy(p->func, dst.node, src.node, sz.node, 1);
 			}
 			return {};
+		}
+
+	// NOTE(odin-tilde): atomics lower to TB's atomic nodes (lock-prefixed
+	// ops on x64). Fences have no TB node, so they become a LOCKed add of 0
+	// to a dummy global — a full fence on x64.
+	case BuiltinProc_atomic_thread_fence:
+	case BuiltinProc_atomic_signal_fence:
+		{
+			if (p->module->fence_dummy == nullptr) {
+				p->module->fence_dummy = tb_global_create(p->module->mod, -1, "__$fence_dummy", nullptr, TB_LINKAGE_PRIVATE);
+				tb_global_set_storage(p->module->mod, tb_module_get_data(p->module->mod), p->module->fence_dummy, 8, 8, 1);
+			}
+			TB_Node *addr = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)p->module->fence_dummy);
+			TB_Node *zero = tb_inst_uint(p->func, TB_TYPE_I64, 0);
+			tb_builder_atomic_rmw(cg_tb_g(p->func), 0, TB_ATOMIC_ADD, addr, zero, TB_MEM_ORDER_SEQ_CST);
+			return {};
+		}
+
+	// NOTE(odin-tilde): TB has no pause/spin-loop-hint node; cpu_relax is
+	// only a performance hint, so a no-op is semantically correct.
+	case BuiltinProc_cpu_relax:
+		return {};
+
+	case BuiltinProc_atomic_load:
+	case BuiltinProc_atomic_load_explicit:
+		{
+			cgValue dst = cg_flatten_value(p, cg_build_expr(p, ce->args[0]));
+			Type *t = type_deref(dst.type);
+			TB_MemoryOrder order = TB_MEM_ORDER_SEQ_CST;
+			if (id == BuiltinProc_atomic_load_explicit) {
+				order = cg_tb_memory_order_from_odin(ce->args[1]);
+			}
+			TB_Node *n = tb_builder_atomic_load(cg_tb_g(p->func), 0, cg_data_type(t), dst.node, order);
+			return cg_value(n, t);
+		}
+
+	case BuiltinProc_atomic_store:
+	case BuiltinProc_atomic_store_explicit:
+		{
+			cgValue dst = cg_flatten_value(p, cg_build_expr(p, ce->args[0]));
+			Type *t = type_deref(dst.type);
+			cgValue v = cg_emit_conv(p, cg_build_expr(p, ce->args[1]), t);
+			v = cg_flatten_value(p, v);
+			TB_MemoryOrder order = TB_MEM_ORDER_SEQ_CST;
+			if (id == BuiltinProc_atomic_store_explicit) {
+				order = cg_tb_memory_order_from_odin(ce->args[2]);
+			}
+			tb_builder_atomic_store(cg_tb_g(p->func), 0, dst.node, v.node, order);
+			return {};
+		}
+
+	case BuiltinProc_atomic_add:
+	case BuiltinProc_atomic_sub:
+	case BuiltinProc_atomic_and:
+	case BuiltinProc_atomic_or:
+	case BuiltinProc_atomic_xor:
+	case BuiltinProc_atomic_exchange:
+	case BuiltinProc_atomic_add_explicit:
+	case BuiltinProc_atomic_sub_explicit:
+	case BuiltinProc_atomic_and_explicit:
+	case BuiltinProc_atomic_or_explicit:
+	case BuiltinProc_atomic_xor_explicit:
+	case BuiltinProc_atomic_exchange_explicit:
+		{
+			cgValue dst = cg_flatten_value(p, cg_build_expr(p, ce->args[0]));
+			Type *t = type_deref(dst.type);
+			cgValue v = cg_emit_conv(p, cg_build_expr(p, ce->args[1]), t);
+			v = cg_flatten_value(p, v);
+
+			int op = TB_ATOMIC_ADD;
+			bool negate = false;
+			bool explicit_order = false;
+			switch (id) {
+			case BuiltinProc_atomic_add:               op = TB_ATOMIC_ADD;  break;
+			case BuiltinProc_atomic_sub:               op = TB_ATOMIC_ADD;  negate = true; break;
+			case BuiltinProc_atomic_and:               op = TB_ATOMIC_AND;  break;
+			case BuiltinProc_atomic_or:                op = TB_ATOMIC_OR;   break;
+			case BuiltinProc_atomic_xor:               op = TB_ATOMIC_XOR;  break;
+			case BuiltinProc_atomic_exchange:          op = TB_ATOMIC_XCHG; break;
+			case BuiltinProc_atomic_add_explicit:      op = TB_ATOMIC_ADD;  explicit_order = true; break;
+			case BuiltinProc_atomic_sub_explicit:      op = TB_ATOMIC_ADD;  negate = true; explicit_order = true; break;
+			case BuiltinProc_atomic_and_explicit:      op = TB_ATOMIC_AND;  explicit_order = true; break;
+			case BuiltinProc_atomic_or_explicit:       op = TB_ATOMIC_OR;   explicit_order = true; break;
+			case BuiltinProc_atomic_xor_explicit:      op = TB_ATOMIC_XOR;  explicit_order = true; break;
+			case BuiltinProc_atomic_exchange_explicit: op = TB_ATOMIC_XCHG; explicit_order = true; break;
+			}
+
+			TB_MemoryOrder order = TB_MEM_ORDER_SEQ_CST;
+			if (explicit_order) {
+				order = cg_tb_memory_order_from_odin(ce->args[2]);
+			}
+
+			if (negate) {
+				// NOTE(odin-tilde): TB has no atomic sub; add of the
+				// negated value is equivalent.
+				TB_DataType dt = cg_data_type(t);
+				TB_Node *zero = tb_inst_uint(p->func, dt, 0);
+				v.node = tb_inst_sub(p->func, zero, v.node, TB_ARITHMATIC_NONE);
+			}
+
+			TB_Node *n = tb_builder_atomic_rmw(cg_tb_g(p->func), 0, op, dst.node, v.node, order);
+			return cg_value(n, t);
+		}
+
+	// NOTE(odin-tilde): cxchg lowers to TB_ATOMIC_CAS (lock cmpxchg on x64).
+	// weak/strong are identical on x64; the bool is old == expected.
+	case BuiltinProc_atomic_compare_exchange_strong:
+	case BuiltinProc_atomic_compare_exchange_weak:
+	case BuiltinProc_atomic_compare_exchange_strong_explicit:
+	case BuiltinProc_atomic_compare_exchange_weak_explicit:
+		{
+			cgValue dst = cg_flatten_value(p, cg_build_expr(p, ce->args[0]));
+			Type *elem = type_deref(dst.type);
+			cgValue old_v = cg_emit_conv(p, cg_build_expr(p, ce->args[1]), elem);
+			cgValue new_v = cg_emit_conv(p, cg_build_expr(p, ce->args[2]), elem);
+			old_v = cg_flatten_value(p, old_v);
+			new_v = cg_flatten_value(p, new_v);
+
+			TB_MemoryOrder order = TB_MEM_ORDER_SEQ_CST;
+			if (id == BuiltinProc_atomic_compare_exchange_strong_explicit ||
+			    id == BuiltinProc_atomic_compare_exchange_weak_explicit) {
+				order = cg_tb_memory_order_from_odin(ce->args[3]);
+			}
+
+			TB_Node *old_n = tb_builder_atomic_cas(cg_tb_g(p->func), 0, dst.node, old_v.node, new_v.node, order);
+
+			Type *res_type = type_of_expr(expr);
+			// NOTE(odin-tilde): cxchg is #optional_ok; when the bool is
+			// dropped the result type is the plain element type.
+			if (res_type->kind == Type_Tuple) {
+				GB_ASSERT(res_type->Tuple.variables.count == 2);
+				Type *ok_type = res_type->Tuple.variables[1]->type;
+				TB_Node *ok_n = tb_inst_cmp_eq(p->func, old_n, old_v.node);
+				return cg_value_multi2(cg_value(old_n, elem), cg_value(ok_n, ok_type), res_type);
+			}
+			return cg_value(old_n, elem);
 		}
 
 	case BuiltinProc_overflow_add:
@@ -993,6 +1331,42 @@ gb_internal cgValue cg_build_builtin(cgProcedure *p, BuiltinProcId id, Ast *expr
 
 			cgValue size = cg_const_int(p, n.type, 8*type_size_of(n.type));
 			return cg_emit_arith(p, Token_Sub, size, cg_value(ones, n.type), n.type);
+		}
+
+	// PATCH(odin-tilde): TB has no inline-asm/CPUID node, and the emitted
+	// x86_64 binaries typically run under Rosetta anyway. Reporting "no
+	// features" keeps every core-library user on its portable fallback
+	// path, which is always correct.
+	case BuiltinProc_x86_cpuid:
+		{
+			Type *res_type = type_of_expr(expr);
+			GB_ASSERT(res_type->kind == Type_Tuple);
+			GB_ASSERT(res_type->Tuple.variables.count == 4);
+			auto values = array_make<cgValue>(permanent_allocator(), 4);
+			for (isize i = 0; i < 4; i++) {
+				values[i] = cg_const_int(p, t_u32, 0);
+			}
+			Slice<cgValue> sv = {};
+			sv.data  = values.data;
+			sv.count = values.count;
+			return cg_value_multi(sv, res_type);
+		}
+
+	case BuiltinProc_x86_xgetbv:
+		{
+			Type *res_type = type_of_expr(expr);
+			GB_ASSERT(res_type->kind == Type_Tuple);
+			GB_ASSERT(res_type->Tuple.variables.count == 2);
+			return cg_value_multi2(cg_const_int(p, t_u32, 0), cg_const_int(p, t_u32, 0), res_type);
+		}
+
+	// PATCH(odin-tilde): without inline asm the valgrind client-request
+	// sequence cannot be emitted; when not running under valgrind the real
+	// thing returns its `default` argument, so just do that.
+	case BuiltinProc_valgrind_client_request:
+		{
+			cgValue def = cg_build_expr(p, ce->args[0]);
+			return cg_emit_conv(p, def, type_of_expr(expr));
 		}
 
 	}

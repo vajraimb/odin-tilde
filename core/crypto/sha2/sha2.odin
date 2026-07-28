@@ -119,7 +119,13 @@ _init :: proc(ctx: ^$T) {
 			panic("crypto/sha2: invalid digest output length")
 		}
 
-		ctx.is_hw_accelerated = is_hardware_accelerated_256()
+		// NOTE(odin-tilde): the tilde backend cannot emit the LLVM-specific
+		// SHA-NI intrinsics, so force the portable transform path.
+		when ODIN_TILDE {
+			ctx.is_hw_accelerated = false
+		} else {
+			ctx.is_hw_accelerated = is_hardware_accelerated_256()
+		}
 	} else when T == Context_512 {
 		switch ctx.md_bits {
 		case 256:
@@ -156,7 +162,11 @@ _init :: proc(ctx: ^$T) {
 			panic("crypto/sha2: invalid digest output length")
 		}
 
-		ctx.is_hw_accelerated = is_hardware_accelerated_512()
+		when ODIN_TILDE {
+			ctx.is_hw_accelerated = false
+		} else {
+			ctx.is_hw_accelerated = is_hardware_accelerated_512()
+		}
 	}
 
 	ctx.length = 0
@@ -408,9 +418,13 @@ SHA512_F4 :: #force_inline proc "contextless" (x: u64) -> u64 {
 @(private = "file")
 sha2_transf :: proc "contextless" (ctx: ^$T, data: []byte) #no_bounds_check {
 	when T == Context_256 {
-		if ctx.is_hw_accelerated {
-			sha256_transf_hw(ctx, data)
-			return
+		// NOTE(odin-tilde): keep the hw transform unreferenced so the
+		// LLVM-intrinsic foreign symbols are never pulled in.
+		when !ODIN_TILDE {
+			if ctx.is_hw_accelerated {
+				sha256_transf_hw(ctx, data)
+				return
+			}
 		}
 
 		w: [SHA256_ROUNDS]u32
@@ -419,9 +433,11 @@ sha2_transf :: proc "contextless" (ctx: ^$T, data: []byte) #no_bounds_check {
 
 		CURR_BLOCK_SIZE :: BLOCK_SIZE_256
 	} else when T == Context_512 {
-		if ctx.is_hw_accelerated {
-			sha512_transf_hw(ctx, data)
-			return
+		when !ODIN_TILDE {
+			if ctx.is_hw_accelerated {
+				sha512_transf_hw(ctx, data)
+				return
+			}
 		}
 
 		w: [SHA512_ROUNDS]u64

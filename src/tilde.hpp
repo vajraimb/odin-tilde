@@ -259,6 +259,10 @@ struct cgModule {
 
 	std::atomic<u32> nested_type_name_guid;
 	std::atomic<u32> const_nil_guid;
+
+	// NOTE(odin-tilde): dummy global used as the target of LOCKed RMWs to
+	// implement atomic fences (TB has no fence node).
+	TB_Global *fence_dummy;
 };
 
 #ifndef ABI_PKG_NAME_SEPARATOR

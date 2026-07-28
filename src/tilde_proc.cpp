@@ -895,6 +895,22 @@ gb_internal cgValue cg_build_call_expr_internal(cgProcedure *p, Ast *expr) {
 		}
 	}
 
+	// PATCH(odin-tilde): u128 arithmetic is not supported by this backend, so
+	// math_bits.mul_u64 (which is defined via u128) is lowered directly to a
+	// hardware widening multiply (TB_UMULPAIR -> RDX:RAX on x64).
+	if (proc_entity != nullptr && proc_entity->kind == Entity_Procedure &&
+	    proc_entity->pkg != nullptr && proc_entity->pkg->name == "math_bits" &&
+	    proc_entity->token.string == "mul_u64" && ce->args.count == 2) {
+		cgValue x = cg_flatten_value(p, cg_emit_conv(p, cg_build_expr(p, ce->args[0]), t_u64));
+		cgValue y = cg_flatten_value(p, cg_emit_conv(p, cg_build_expr(p, ce->args[1]), t_u64));
+		TB_Node *hi = nullptr;
+		TB_Node *lo = tb_builder_umulpair(cg_tb_g(p->func), x.node, y.node, &hi);
+		Type *res_type = type_of_expr(expr);
+		GB_ASSERT(res_type->kind == Type_Tuple);
+		GB_ASSERT(res_type->Tuple.variables.count == 2);
+		return cg_value_multi2(cg_value(hi, t_u64), cg_value(lo, t_u64), res_type);
+	}
+
 	if (proc_expr->tav.mode == Addressing_Constant) {
 		ExactValue v = proc_expr->tav.value;
 		switch (v.kind) {
@@ -1327,7 +1343,7 @@ gb_internal cgProcedure *cg_hasher_proc_for_type(cgModule *m, Type *type) {
 			args[0] = data;
 			args[1] = seed;
 			cgValue res = cg_emit_call(p, variant_hasher, args);
-			cg_build_return_stmt_internal_single(p, seed);
+			cg_build_return_stmt_internal_single(p, res);
 		} else {
 			TB_Node *end_region = cg_control_region(p, "bend");
 			TB_Node *switch_region = cg_control_region(p, "bswitch");
@@ -1408,12 +1424,12 @@ gb_internal cgProcedure *cg_hasher_proc_for_type(cgModule *m, Type *type) {
 		args[0] = data;
 		args[1] = seed;
 		cgValue res = cg_emit_runtime_call(p, "default_hasher_cstring", args);
-		cg_build_return_stmt_internal_single(p, seed);
+		cg_build_return_stmt_internal_single(p, res);
 	} else if (is_type_string(type)) {
 		args[0] = data;
 		args[1] = seed;
 		cgValue res = cg_emit_runtime_call(p, "default_hasher_string", args);
-		cg_build_return_stmt_internal_single(p, seed);
+		cg_build_return_stmt_internal_single(p, res);
 	} else {
 		GB_PANIC("Unhandled type for hasher: %s", type_to_string(type));
 	}

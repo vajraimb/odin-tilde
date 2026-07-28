@@ -324,7 +324,27 @@ gb_internal TB_DebugType *cg_debug_type_internal(cgModule *m, Type *type) {
 	case Type_MultiPointer:
 		return tb_debug_create_ptr(m->mod, cg_debug_type(m, type->MultiPointer.elem));
 	case Type_Array:
-		return tb_debug_create_array(m->mod, cg_debug_type(m, type->Array.elem), type->Array.count);
+		{
+			// NOTE(odin-tilde): TB's ABI classification treats ARRAY debug
+			// types as pointer-sized (C semantics), which would misclassify a
+			// >8 byte value array as TB_PASSING_DIRECT (single register
+			// blob). Model value arrays as a struct of elements so big
+			// arrays correctly go TB_PASSING_INDIRECT and small ones keep
+			// the integer-blob path (same trick as Type_SimdVector).
+			Type *elem = type->Array.elem;
+			i64 count = type->Array.count;
+			TB_DebugType *record = tb_debug_create_struct(m->mod, 0, "");
+			TB_DebugType **fields = tb_debug_record_begin(m->mod, record, count);
+			TB_DebugType *elem_type = cg_debug_type(m, elem);
+			TB_CharUnits elem_size = cast(TB_CharUnits)type_size_of(elem);
+			for (i64 i = 0; i < count; i++) {
+				fields[i] = tb_debug_create_field(m->mod, elem_type, 1, "_", i * elem_size);
+			}
+			tb_debug_record_end(record,
+				cast(TB_CharUnits)type_size_of(type),
+				cast(TB_CharUnits)type_align_of(type));
+			return record;
+		}
 	case Type_EnumeratedArray:
 		return tb_debug_create_array(m->mod, cg_debug_type(m, type->EnumeratedArray.elem), type->EnumeratedArray.count);
 	case Type_Slice:
@@ -468,11 +488,42 @@ gb_internal TB_DebugType *cg_debug_type_internal(cgModule *m, Type *type) {
 	case Type_BitSet:
 		return cg_debug_type(m, bit_set_to_int(type));
 	case Type_SimdVector:
-		return tb_debug_create_array(m->mod, cg_debug_type(m, type->SimdVector.elem), type->SimdVector.count);
+		{
+			// NOTE(odin-tilde): TB's ABI classification treats ARRAY debug
+			// types as pointer-sized (C semantics), which would classify a
+			// 16-byte vector as TB_PASSING_DIRECT (single register blob).
+			// Model vectors as a struct of lanes so big vectors correctly go
+			// TB_PASSING_INDIRECT and small ones keep the integer-blob path.
+			Type *elem = type->SimdVector.elem;
+			isize count = type->SimdVector.count;
+			TB_DebugType *record = tb_debug_create_struct(m->mod, 0, "");
+			TB_DebugType **fields = tb_debug_record_begin(m->mod, record, count);
+			TB_DebugType *elem_type = cg_debug_type(m, elem);
+			TB_CharUnits elem_size = cast(TB_CharUnits)type_size_of(elem);
+			for (isize i = 0; i < count; i++) {
+				fields[i] = tb_debug_create_field(m->mod, elem_type, 1, "_", i * elem_size);
+			}
+			tb_debug_record_end(record,
+				cast(TB_CharUnits)type_size_of(type),
+				cast(TB_CharUnits)type_align_of(type));
+			return record;
+		}
 	case Type_Matrix:
 		{
+			// NOTE(odin-tilde): same struct treatment as Type_SimdVector.
+			Type *elem = type->Matrix.elem;
 			i64 count = matrix_type_total_internal_elems(type);
-			return tb_debug_create_array(m->mod, cg_debug_type(m, type->Matrix.elem), count);
+			TB_DebugType *record = tb_debug_create_struct(m->mod, 0, "");
+			TB_DebugType **fields = tb_debug_record_begin(m->mod, record, count);
+			TB_DebugType *elem_type = cg_debug_type(m, elem);
+			TB_CharUnits elem_size = cast(TB_CharUnits)type_size_of(elem);
+			for (i64 i = 0; i < count; i++) {
+				fields[i] = tb_debug_create_field(m->mod, elem_type, 1, "_", i * elem_size);
+			}
+			tb_debug_record_end(record,
+				cast(TB_CharUnits)type_size_of(type),
+				cast(TB_CharUnits)type_align_of(type));
+			return record;
 		}
 	case Type_SoaPointer:
 		{

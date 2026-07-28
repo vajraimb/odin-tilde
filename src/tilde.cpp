@@ -465,6 +465,7 @@ gb_internal cgModule *cg_module_create(Checker *c) {
 	// NOTE(macos): x86_64 + SystemV ABI for darwin_amd64 output (runs under
 	// Rosetta on Apple Silicon). TLS index is a Windows concept — omitted.
 	m->mod = tb_module_create(TB_ARCH_X86_64, TB_SYSTEM_MACOS, is_jit);
+	m->fence_dummy = nullptr;
 
 	map_init(&m->values);
 	map_init(&m->symbols);

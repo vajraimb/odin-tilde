@@ -717,7 +717,16 @@ gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left
 			}
 		}
 
-		bool is_signed = is_type_integer(left.type) && !is_type_unsigned(left.type);
+		// PATCH(odin-tilde): is_type_integer is false for enums, which used to
+		// silently select the unsigned form; enums compare with the signedness
+		// of their base integer type (e.g. Ordering's -1 must compare signed).
+		bool is_signed = false;
+		if (is_type_integer(left.type)) {
+			is_signed = !is_type_unsigned(left.type);
+		} else if (is_type_enum(left.type)) {
+			Type *enum_base = base_type(left.type)->Enum.base_type;
+			is_signed = is_type_integer(enum_base) && !is_type_unsigned(enum_base);
+		}
 		switch (op_kind) {
 		case Token_CmpEq: res = tb_inst_cmp_eq(p->func, lhs, rhs); break;
 		case Token_NotEq: res = tb_inst_cmp_ne(p->func, lhs, rhs); break;
@@ -1410,6 +1419,19 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 		// PATCH(odin-tilde): scalarized splat — #simd values live in memory,
 		// so a scalar -> vector conversion replicates the scalar into every
 		// lane of a temporary local
+		if (is_type_simd_vector(src)) {
+			// PATCH(odin-tilde): vector -> vector is a pure bitcast (mirrors
+			// lb_emit_conv); copy the bytes into a dst-typed temporary
+			GB_ASSERT_MSG(type_size_of(src) == type_size_of(dst),
+			              "%s -> %s (in %.*s)", type_to_string(src), type_to_string(dst), LIT(p->name));
+			cgValue sa = cg_address_from_load_or_generate_local(p, value);
+			cgAddr tmp = cg_add_local(p, dst, nullptr, false);
+			cgValue dp = cg_addr_get_ptr(p, tmp);
+			tb_inst_memcpy(p->func, dp.node, sa.node,
+			               tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)type_size_of(dst)),
+			               cast(TB_CharUnits)type_align_of(dst));
+			return cg_addr_load(p, tmp);
+		}
 		GB_ASSERT_MSG(!is_type_simd_vector(src), "%s -> #simd vector (in %.*s)", type_to_string(src), LIT(p->name));
 		Type *bt = base_type(dst);
 		Type *et = bt->SimdVector.elem;
@@ -1861,24 +1883,20 @@ gb_internal cgAddr cg_build_addr_slice_expr(cgProcedure *p, Ast *expr) {
 	}
 
 	case Type_DynamicArray: {
-		// Type *elem_type = type->DynamicArray.elem;
-		// Type *slice_type = alloc_type_slice(elem_type);
-
-		// lbValue len = lb_dynamic_array_len(p, base);
-		// if (high.value == nullptr) high = len;
-
-		// if (!no_indices) {
-		// 	lb_emit_slice_bounds_check(p, se->open, low, high, len, se->low != nullptr);
-		// }
-
-		// lbValue elem    = lb_emit_ptr_offset(p, lb_dynamic_array_elem(p, base), low);
-		// lbValue new_len = lb_emit_arith(p, Token_Sub, high, low, t_int);
-
-		// lbAddr slice = lb_add_local_generated(p, slice_type, false);
-		// lb_fill_slice(p, slice, elem, new_len);
-		// return slice;
-		GB_PANIC("cg_build_addr_slice_expr Type_DynamicArray");
-		break;
+		// PATCH(odin-tilde): mirror the Type_Slice path; the dynamic array
+		// rvalue lives in memory so raw_data/len read its fields directly.
+		Type *slice_type = type_of_expr(expr);
+		GB_ASSERT(is_type_slice(slice_type));
+		cgValue data = cg_builtin_raw_data(p, base);
+		cgValue len  = cg_builtin_len(p, base);
+		if (high.node == nullptr) {
+			high = len;
+		}
+		cgValue elem    = cg_emit_ptr_offset(p, data, low);
+		cgValue new_len = cg_emit_arith(p, Token_Sub, high, low, t_int);
+		cgAddr res = cg_add_local(p, slice_type, nullptr, false);
+		cg_fill_slice(p, res, elem, new_len);
+		return res;
 	}
 
 	case Type_MultiPointer: {
@@ -2293,7 +2311,10 @@ gb_internal cgValue cg_build_or_return(cgProcedure *p, Ast *arg, Type *final_typ
 	if (final_type != nullptr && !is_type_tuple(final_type)) {
 		return cg_emit_conv(p, lhs, final_type);
 	}
-	return {};
+	// PATCH(odin-tilde): tuple case — return the lhs multi (every value but
+	// the trailing ok) so that multi-value assignment can expand it;
+	// returning an empty value here silently dropped the results.
+	return lhs;
 }
 
 gb_internal cgValue cg_build_or_else(cgProcedure *p, Ast *arg, Ast *else_expr, Type *final_type) {

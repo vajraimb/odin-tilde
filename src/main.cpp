@@ -4158,6 +4158,18 @@ int main(int arg_count, char const **arg_ptr) {
 			get_fullpath_relative(heap_allocator(), odin_root_dir(), str_lit("shared"), nullptr));
 	}
 
+	// PATCH(odin-tilde): the tilde backend only emits x86_64; when the user
+	// did not pick a -target explicitly, default the frontend target to
+	// darwin_amd64 so that ODIN_ARCH/build tags match the emitted code.
+	if (build_context.tilde_backend && selected_target_metrics == nullptr) {
+		for (isize i = 0; i < gb_count_of(named_targets); i++) {
+			if (str_eq_ignore_case(named_targets[i].name, str_lit("darwin_amd64"))) {
+				selected_target_metrics = named_targets + i;
+				break;
+			}
+		}
+	}
+
 	init_build_context(selected_target_metrics ? selected_target_metrics->metrics : nullptr, selected_subtarget);
 	// if (build_context.word_size == 4 && build_context.metrics.os != TargetOs_js) {
 	// 	print_usage_line(0, "%.*s 32-bit is not yet supported for this platform", LIT(args[0]));

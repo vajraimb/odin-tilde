@@ -349,6 +349,12 @@ gb_internal void cg_addr_store(cgProcedure *p, cgAddr addr, cgValue value) {
 	GB_ASSERT(value.type != nullptr);
 	if (is_type_untyped_uninit(value.type)) {
 		Type *t = cg_addr_type(addr);
+		// PATCH(odin-tilde): aggregates have a VOID dt and TB cannot make a
+		// poison integer for them; the destination local is already
+		// uninitialized, so there is simply nothing to store.
+		if (TB_IS_VOID_TYPE(cg_data_type(t))) {
+			return;
+		}
 		value = cg_value(tb_inst_poison(p->func, cg_data_type(t)), t);
 		// TODO(bill): IS THIS EVEN A GOOD IDEA?
 	} else if (is_type_untyped_nil(value.type)) {
@@ -450,6 +456,7 @@ gb_internal cgValue cg_emit_ptr_offset(cgProcedure *p, cgValue ptr, cgValue inde
 
 	Type *elem = type_deref(ptr.type, true);
 	i64 stride = type_size_of(elem);
+	GB_ASSERT_MSG(ptr.node->dt.type == TB_TAG_PTR, "ptr_offset base not PTR: %s dt=%d node=%d (in %.*s)", type_to_string(ptr.type), cast(int)ptr.node->dt.type, cast(int)ptr.node->type, LIT(p->name));
 	return cg_value(tb_inst_array_access(p->func, ptr.node, index.node, stride), alloc_type_pointer(elem));
 }
 gb_internal cgValue cg_emit_array_ep(cgProcedure *p, cgValue s, cgValue index) {
@@ -466,6 +473,7 @@ gb_internal cgValue cg_emit_array_ep(cgProcedure *p, cgValue s, cgValue index) {
 
 	Type *elem = base_array_type(st);
 	i64 stride = type_size_of(elem);
+	GB_ASSERT_MSG(s.node->dt.type == TB_TAG_PTR, "array_ep base not PTR: %s (in %.*s)", type_to_string(t), LIT(p->name));
 	return cg_value(tb_inst_array_access(p->func, s.node, index.node, stride), alloc_type_pointer(elem));
 }
 gb_internal cgValue cg_emit_array_epi(cgProcedure *p, cgValue s, i64 index) {
@@ -1218,7 +1226,8 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 				} else {
 					GB_ASSERT(result.kind == cgValue_Value);
 					TB_DataType st = result.node->dt;
-					GB_ASSERT(st.type == dt.type);
+					// NOTE(odin-tilde): compares yield TB_TAG_BOOL nodes while
+					// prototypes use I8 for Odin bools; handled by zxt below.
 					if (st.raw == dt.raw) {
 						final_res = result.node;
 					} else if (st.type == TB_TAG_BOOL) {
@@ -1954,6 +1963,117 @@ gb_internal void cg_build_range_string(cgProcedure *p, cgValue expr, Type *val_t
 }
 
 
+// PATCH(odin-tilde): map iteration, ported from lb_build_range_map.
+// Cells layout: [key cells][value cells][hashes]; a slot is live when its
+// hash is non-zero and its top bit (deleted marker) is clear.
+gb_internal cgValue cg_map_cap(cgProcedure *p, cgValue value) {
+	GB_ASSERT_MSG(is_type_map(value.type) || are_types_identical(value.type, t_raw_map), "%s", type_to_string(value.type));
+	cgValue zero = cg_const_int(p, t_uintptr, 0);
+	cgValue one  = cg_const_int(p, t_uintptr, 1);
+	cgValue mask = cg_const_int(p, t_uintptr, MAP_CACHE_LINE_SIZE-1);
+	cgValue data = cg_emit_struct_ev(p, value, 0);
+	cgValue log2_cap = cg_emit_arith(p, Token_And, data, mask, t_uintptr);
+	return cg_emit_arith(p, Token_Shl, one, log2_cap, t_uintptr);
+}
+
+gb_internal cgValue cg_map_cell_index_static(cgProcedure *p, Type *type, cgValue cells_ptr, cgValue index) {
+	i64 size, len;
+	i64 elem_sz = type_size_of(type);
+	map_cell_size_and_len(type, &size, &len);
+
+	index = cg_emit_conv(p, index, t_uintptr);
+
+	if (size == len*elem_sz) {
+		cgValue elems_ptr = cg_emit_conv(p, cells_ptr, alloc_type_pointer(type));
+		return cg_emit_ptr_offset(p, elems_ptr, index);
+	}
+
+	cgValue cell_index = {};
+	cgValue data_index = {};
+
+	cgValue size_const = cg_const_int(p, t_uintptr, size);
+	cgValue len_const  = cg_const_int(p, t_uintptr, len);
+
+	if (is_power_of_two(len)) {
+		u64 log2_len = floor_log2(cast(u64)len);
+		cell_index = log2_len == 0 ? index : cg_emit_arith(p, Token_Shr, index, cg_const_int(p, t_uintptr, log2_len), t_uintptr);
+		data_index = cg_emit_arith(p, Token_And, index, cg_const_int(p, t_uintptr, len-1), t_uintptr);
+	} else {
+		cell_index = cg_emit_arith(p, Token_Quo, index, len_const, t_uintptr);
+		data_index = cg_emit_arith(p, Token_Mod, index, len_const, t_uintptr);
+	}
+
+	cgValue elems_ptr = cg_emit_conv(p, cells_ptr, t_uintptr);
+	cgValue cell_offset = cg_emit_arith(p, Token_Mul, size_const, cell_index, t_uintptr);
+	elems_ptr = cg_emit_arith(p, Token_Add, elems_ptr, cell_offset, t_uintptr);
+
+	elems_ptr = cg_emit_conv(p, elems_ptr, alloc_type_pointer(type));
+	return cg_emit_ptr_offset(p, elems_ptr, data_index);
+}
+
+gb_internal cgValue cg_map_hash_is_valid(cgProcedure *p, cgValue hash) {
+	// N :: size_of(uintptr)*8 - 1
+	// (hash != 0) & (hash>>N == 0)
+	u64 top_bit_index = cast(u64)(type_size_of(t_uintptr)*8 - 1);
+	cgValue shift_amount = cg_const_int(p, t_uintptr, top_bit_index);
+	cgValue zero = cg_const_int(p, t_uintptr, 0);
+
+	cgValue not_empty = cg_emit_comp(p, Token_NotEq, hash, zero);
+
+	cgValue not_deleted = cg_emit_arith(p, Token_Shr, hash, shift_amount, t_uintptr);
+	not_deleted = cg_emit_comp(p, Token_CmpEq, not_deleted, zero);
+
+	return cg_emit_arith(p, Token_And, not_deleted, not_empty, t_uintptr);
+}
+
+gb_internal void cg_build_range_map(cgProcedure *p, cgValue expr, Type *val_type,
+                                    cgValue *val_, cgValue *key_, TB_Node **loop_, TB_Node **done_) {
+	Type *type = base_type(type_deref(expr.type));
+	GB_ASSERT(type->kind == Type_Map);
+
+	cgAddr index = cg_add_local(p, t_int, nullptr, false);
+	cg_addr_store(p, index, cg_const_int(p, t_int, cast(u64)-1));
+
+	TB_Node *loop = cg_control_region_loop(p, "for.index.loop");
+	cg_emit_goto(p, loop);
+	tb_inst_set_control(p->func, loop);
+
+	cgValue incr = cg_emit_arith(p, Token_Add, cg_addr_load(p, index), cg_const_int(p, t_int, 1), t_int);
+	cg_addr_store(p, index, incr);
+
+	TB_Node *hash_check = cg_control_region(p, "for.index.hash_check");
+	TB_Node *body       = cg_control_region(p, "for.index.body");
+	TB_Node *done       = cg_control_region(p, "for.index.done");
+
+	cgValue map_value = cg_emit_load(p, expr);
+	cgValue capacity  = cg_map_cap(p, map_value);
+	cgValue cond      = cg_emit_comp(p, Token_Lt, incr, capacity);
+	cg_emit_if(p, cond, hash_check, done);
+	tb_inst_set_control(p->func, hash_check);
+
+	cgValue idx = cg_addr_load(p, index);
+
+	cgValue ks = cg_map_data_uintptr(p, map_value);
+	cgValue vs = cg_emit_conv(p, cg_map_cell_index_static(p, type->Map.key, ks, capacity), alloc_type_pointer(type->Map.value));
+	cgValue hs = cg_emit_conv(p, cg_map_cell_index_static(p, type->Map.value, vs, capacity), alloc_type_pointer(t_uintptr));
+
+	cgValue hash = cg_emit_load(p, cg_emit_ptr_offset(p, hs, idx));
+
+	cgValue hash_cond = cg_map_hash_is_valid(p, hash);
+	cg_emit_if(p, hash_cond, body, loop);
+	tb_inst_set_control(p->func, body);
+
+	cgValue key_ptr = cg_map_cell_index_static(p, type->Map.key, ks, idx);
+	cgValue val_ptr = cg_map_cell_index_static(p, type->Map.value, vs, idx);
+	cgValue key = cg_emit_load(p, key_ptr);
+	cgValue val = cg_emit_load(p, val_ptr);
+
+	if (val_)  *val_  = val;
+	if (key_)  *key_  = key;
+	if (loop_) *loop_ = loop;
+	if (done_) *done_ = done;
+}
+
 gb_internal void cg_build_range_stmt(cgProcedure *p, Ast *node) {
 	ast_node(rs, RangeStmt, node);
 
@@ -2006,8 +2126,7 @@ gb_internal void cg_build_range_stmt(cgProcedure *p, Ast *node) {
 			if (is_type_pointer(type_deref(map.type))) {
 				map = cg_emit_load(p, map);
 			}
-			GB_PANIC("TODO(bill): cg_build_range_map");
-			// cg_build_range_map(p, map, val1_type, &val, &key, &loop, &done);
+			cg_build_range_map(p, map, val1_type, &val, &key, &loop, &done);
 			break;
 		}
 		case Type_Array: {

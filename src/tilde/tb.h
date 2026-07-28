@@ -931,6 +931,10 @@ TB_API TB_Node* tb_builder_string(TB_GraphBuilder* g, ptrdiff_t len, const char*
 // works with type: AND, OR, XOR, ADD, SUB, MUL, SHL, SHR, SAR, ROL, ROR, UDIV, SDIV, UMOD, SMOD.
 // note that arithmetic behavior is irrelevant for some of the operations (but 0 is always a good default).
 TB_API TB_Node* tb_builder_binop_int(TB_GraphBuilder* g, int type, TB_Node* a, TB_Node* b, TB_ArithmeticBehavior ab);
+
+// PATCH(odin-tilde): public widening-multiply builder for frontends.
+// Returns the low half (proj 0) and stores the high half (proj 1) into *out_hi.
+TB_API TB_Node* tb_builder_umulpair(TB_GraphBuilder* g, TB_Node* a, TB_Node* b, TB_Node** out_hi);
 TB_API TB_Node* tb_builder_binop_float(TB_GraphBuilder* g, int type, TB_Node* a, TB_Node* b);
 
 TB_API TB_Node* tb_builder_select(TB_GraphBuilder* g, TB_Node* cond, TB_Node* a, TB_Node* b);
@@ -962,6 +966,10 @@ TB_API void tb_builder_memzero(TB_GraphBuilder* g, int mem_var, bool ctrl_dep, T
 // returns initially loaded value
 TB_API TB_Node* tb_builder_atomic_rmw(TB_GraphBuilder* g, int mem_var, int op, TB_Node* addr, TB_Node* val, TB_MemoryOrder order);
 TB_API TB_Node* tb_builder_atomic_load(TB_GraphBuilder* g, int mem_var, TB_DataType dt, TB_Node* addr, TB_MemoryOrder order);
+// PATCH(odin-tilde): CAS builder (also see tb_builder_atomic_store, which
+// exists in new_builder.c but was never declared here).
+TB_API TB_Node* tb_builder_atomic_cas(TB_GraphBuilder* g, int mem_var, TB_Node* addr, TB_Node* expected, TB_Node* new_val, TB_MemoryOrder order);
+TB_API TB_Node* tb_builder_atomic_store(TB_GraphBuilder* g, int mem_var, TB_Node* addr, TB_Node* val, TB_MemoryOrder order);
 
 // splitting/merging:
 //   splits the 'in_mem' variable, this writes over in_mem with a split
