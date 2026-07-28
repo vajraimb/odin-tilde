@@ -944,6 +944,17 @@ gb_internal cgValue cg_build_builtin(cgProcedure *p, BuiltinProcId id, Ast *expr
 			return cg_builtin_abs(p, x);
 		}
 
+	case BuiltinProc_sqrt:
+		{
+			// PATCH(odin-tilde): scalar/vector float sqrt via TB_FSQRT
+			// (x64 sqrtsd/sqrtss), mirrors the LLVM backend's llvm.sqrt path.
+			Type *type = type_of_expr(expr);
+			cgValue x = cg_build_expr(p, ce->args[0]);
+			x = cg_emit_conv(p, x, type);
+			TB_Node *r = tb_inst_fsqrt(p->func, x.node);
+			return cg_value(r, type);
+		}
+
 	case BuiltinProc_clamp:
 		{
 			cgValue x   = cg_build_expr(p, ce->args[0]);

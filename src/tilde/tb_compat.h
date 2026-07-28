@@ -297,6 +297,7 @@ gb_internal TB_Node *tb_inst_cmp_fge(TB_Function *f, TB_Node *a, TB_Node *b)    
 // unary ops & intrinsics
 // ------------------------------------------------------------------
 gb_internal TB_Node *tb_inst_bswap(TB_Function *f, TB_Node *n)    { return tb_builder_unary(cg_tb_g(f), TB_BSWAP, n); }
+gb_internal TB_Node *tb_inst_fsqrt(TB_Function *f, TB_Node *n)    { return tb_builder_unary(cg_tb_g(f), TB_FSQRT, n); }
 
 // NOTE(odin-tilde): TB_CLZ/TB_CTZ/TB_POPCNT have no x64 isel support in the
 // current Cuik/TB tree, so expand them into SWAR bit-twiddling sequences in

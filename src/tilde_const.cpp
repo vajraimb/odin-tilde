@@ -290,6 +290,14 @@ gb_internal i64 cg_global_const_calculate_region_count_from_basic_type(Type *typ
 			return count*type->EnumeratedArray.count;
 		}
 
+	case Type_FixedCapacityDynamicArray:
+		{
+			// layout: { [capacity]elem data, padding, int len }
+			Type *elem = type->FixedCapacityDynamicArray.elem;
+			i64 count = cg_global_const_calculate_region_count_from_basic_type(elem);
+			return count*type->FixedCapacityDynamicArray.capacity + 1; // +1 for len
+		}
+
 	case Type_Struct:
 		if (type->Struct.is_raw_union) {
 			i64 max_count = 0;
