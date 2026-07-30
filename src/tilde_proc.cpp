@@ -433,6 +433,7 @@ gb_internal void cg_procedure_begin(cgProcedure *p) {
 
 extern "C" bool tb_opt__REGALLOC;
 extern "C" bool tb_opt__REGSPLIT;
+extern "C" bool tb_opt_peeps_only(TB_Function *f, TB_Worklist *ws);
 
 gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 	cgProcedure *p = cast(cgProcedure *)data;
@@ -468,9 +469,13 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 	}
 
 	// NOTE(new-tb): the old tb_pass_* driver is gone; optimization is
-	// tb_opt(...) and machine-code emission is tb_codegen(...).
+	// tb_opt(...) and machine-code emission is tb_codegen(...). We run the
+	// peephole-only subset: local idioms (rotate recognition, etc.) and DCE,
+	// without locals-to-SSA / loop opts / SLP (untested in this pipeline).
 	TB_Worklist *ws = tb_worklist_alloc();
 	defer (tb_worklist_free(ws));
+
+	tb_opt_peeps_only(p->func, ws);
 
 	bool emit_asm = false;
 	if (
@@ -494,11 +499,6 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 			fprintf(stdout, "\n");
 			fflush(stdout);
 		}
-	}
-
-	// optimize (old glue had its passes disabled too; keep parity for now)
-	if (false) {
-		tb_opt(p->func, ws, false);
 	}
 
 	// compile
@@ -628,6 +628,112 @@ gb_internal cgValue cg_find_procedure_value_from_entity(cgModule *m, Entity *e) 
 
 
 gb_internal cgValue cg_build_call_expr_internal(cgProcedure *p, Ast *expr);
+
+// PATCH(odin-tilde): #force_inline procs are inlined at the AST level. The
+// LLVM backend gets this for free from the alwaysinline attribute (even at
+// -O0); tilde has no inliner, so core crypto/bit helpers (SHA256_F1-F4 & co)
+// stayed real calls — one of the last measurable runtime gaps. This is a
+// deliberately restricted v1: the callee must be a checked, non-foreign,
+// contextless (no implicit context rebinding), monomorphic (no type/const
+// params), non-variadic proc whose body is a single `return <exprs>;`.
+// Param entities are bound to the evaluated argument values in the caller's
+// entity map and the return expression is built in the caller's TB function.
+gb_internal bool cg_try_build_force_inline_call(cgProcedure *p, Ast *expr, Entity *proc_entity, cgValue *out) {
+	ast_node(ce, CallExpr, expr);
+
+	if (proc_entity == nullptr || proc_entity->kind != Entity_Procedure) return false;
+	if (proc_entity->Procedure.is_foreign) return false;
+	if ((proc_entity->flags & EntityFlag_ProcBodyChecked) == 0) return false;
+
+	DeclInfo *decl = decl_info_of_entity(proc_entity);
+	if (decl == nullptr || decl->proc_lit == nullptr) return false;
+	ast_node(pl, ProcLit, decl->proc_lit);
+	if (pl->inlining != ProcInlining_inline) return false; // #force_inline
+
+	TypeProc *pt = &base_type(proc_entity->type)->Proc;
+	if (pt->calling_convention != ProcCC_Contextless) return false;
+	if (pt->variadic || pt->c_vararg) return false;
+	if (ce->ellipsis.pos.line != 0) return false;
+	if (ce->split_args == nullptr || ce->split_args->named.count != 0) return false;
+
+	if (pl->body == nullptr || pl->body->kind != Ast_BlockStmt) return false;
+	AstBlockStmt *body = &pl->body->BlockStmt;
+	if (body->stmts.count != 1) return false;
+	Ast *stmt = body->stmts[0];
+	if (stmt->kind != Ast_ReturnStmt) return false;
+	AstReturnStmt *rs = &stmt->ReturnStmt;
+
+	TEMPORARY_ALLOCATOR_GUARD();
+
+	auto params = array_make<Entity *>(temporary_allocator(), 0, pt->param_count);
+	if (pt->params) for (Entity *e : pt->params->Tuple.variables) {
+		if (e->kind != Entity_Variable) return false; // type/const param: polymorphic, skip v1
+		array_add(&params, e);
+	}
+	if (params.count != ce->args.count) return false;
+
+	auto results = array_make<Entity *>(temporary_allocator(), 0, pt->result_count);
+	if (pt->results) for (Entity *e : pt->results->Tuple.variables) {
+		array_add(&results, e);
+	}
+	if (results.count != rs->results.count) return false;
+	if (results.count < 1 || results.count > 2) return false;
+	for (Entity *e : results) {
+		// union result conversion is ambiguous for some sources and can hit
+		// the "TODO: src -> union" panic in cg_emit_conv; keep v1 simple
+		if (is_type_union(base_type(e->type))) return false;
+	}
+	if (getenv("TILDE_INLINE_DEBUG")) {
+		String n = proc_entity->token.string;
+		gb_printf_err("[tilde-inline] %.*s\n", cast(int)n.len, n.text);
+		for (Entity *e : results) {
+			gb_printf_err("[tilde-inline]   result type: %s\n", type_to_string(e->type));
+		}
+	}
+
+	// evaluate args once, spill each into a fresh local, and bind the param
+	// entities to their addresses (idents resolve to lvalues, exactly like
+	// regular proc parameters)
+	for_array(i, params) {
+		cgValue a = cg_build_expr(p, ce->args[i]);
+		a = cg_emit_conv(p, a, params[i]->type);
+		a = cg_flatten_value(p, a);
+		cgAddr addr = cg_add_local(p, params[i]->type, params[i], false);
+		cg_addr_store(p, addr, a);
+	}
+
+	if (results.count == 1) {
+		cgValue r = cg_build_expr(p, rs->results[0]);
+		r = cg_emit_conv(p, r, results[0]->type);
+		// NOTE(odin-tilde): conv of untyped nil -> enum goes through
+		// cg_const_nil, which re-types the zero to the enum's *core* type
+		// (e.g. i32). Downstream conversions (enum -> union) then see the
+		// core type and panic. Re-type same-size values to the named type.
+		if (r.kind == cgValue_Value && r.type != results[0]->type &&
+		    type_size_of(r.type) == type_size_of(results[0]->type)) {
+			r = cg_emit_transmute(p, r, results[0]->type);
+		}
+		*out = r;
+	} else {
+		cgValue r0 = cg_emit_conv(p, cg_build_expr(p, rs->results[0]), results[0]->type);
+		cgValue r1 = cg_emit_conv(p, cg_build_expr(p, rs->results[1]), results[1]->type);
+		// NOTE(odin-tilde): conv of untyped nil -> enum goes through
+		// cg_const_nil, which re-types the zero to the enum's *core* type
+		// (e.g. i32). Downstream conversions (enum -> union) then see the
+		// core type and panic. Re-type same-size values to the named type.
+		if (r0.kind == cgValue_Value && r0.type != results[0]->type &&
+		    type_size_of(r0.type) == type_size_of(results[0]->type)) {
+			r0 = cg_emit_transmute(p, r0, results[0]->type);
+		}
+		if (r1.kind == cgValue_Value && r1.type != results[1]->type &&
+		    type_size_of(r1.type) == type_size_of(results[1]->type)) {
+			r1 = cg_emit_transmute(p, r1, results[1]->type);
+		}
+		*out = cg_value_multi2(r0, r1, type_of_expr(expr));
+	}
+	return true;
+}
+
 gb_internal cgValue cg_build_call_expr(cgProcedure *p, Ast *expr) {
 	expr = unparen_expr(expr);
 	ast_node(ce, CallExpr, expr);
@@ -974,6 +1080,13 @@ gb_internal cgValue cg_build_call_expr_internal(cgProcedure *p, Ast *expr) {
 		GB_ASSERT(res_type->kind == Type_Tuple);
 		GB_ASSERT(res_type->Tuple.variables.count == 2);
 		return cg_value_multi2(cg_value(hi, t_u64), cg_value(lo, t_u64), res_type);
+	}
+
+	{
+		cgValue inlined = {};
+		if (cg_try_build_force_inline_call(p, expr, proc_entity, &inlined)) {
+			return inlined;
+		}
 	}
 
 	if (proc_expr->tav.mode == Addressing_Constant) {

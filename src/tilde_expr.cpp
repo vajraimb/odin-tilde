@@ -1919,7 +1919,7 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 			return cg_addr_load(p, parent);
 		}
 
-		GB_PANIC("TODO(bill): %s -> union", type_to_string(src_type));
+		GB_PANIC("TODO(bill): %s -> union(%s)", type_to_string(src_type), type_to_string(t));
 	}
 
 	// NOTE(bill): This has to be done before 'Pointer <-> Pointer' as it's
