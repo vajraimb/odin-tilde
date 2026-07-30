@@ -667,7 +667,34 @@ gb_internal String cg_get_entity_name(cgModule *m, Entity *e) {
 			return e->Variable.link_name;
 		}
 	} else if (e->kind == Entity_Procedure && e->Procedure.link_name.len > 0) {
-		return e->Procedure.link_name;
+		String link_name = e->Procedure.link_name;
+		// NOTE(tilde): core:math declares its basic float ops as foreign procs
+		// with LLVM intrinsic link names (llvm.sin.f32 & co). The LLVM backend
+		// resolves those to real intrinsics; tilde has no such namespace, so
+		// remap them to the plain libm symbols (identical signatures, and the
+		// x64 SysV float ABI makes "none"/"c" calling conventions agree here).
+		if (string_starts_with(link_name, str_lit("llvm."))) {
+			struct cgLLVMMathRemap { String llvm, libm; };
+			static const cgLLVMMathRemap llvm_math_remap[] = {
+				{str_lit("llvm.sin.f32"),      str_lit("sinf")},
+				{str_lit("llvm.sin.f64"),      str_lit("sin")},
+				{str_lit("llvm.cos.f32"),      str_lit("cosf")},
+				{str_lit("llvm.cos.f64"),      str_lit("cos")},
+				{str_lit("llvm.pow.f32"),      str_lit("powf")},
+				{str_lit("llvm.pow.f64"),      str_lit("pow")},
+				{str_lit("llvm.exp.f32"),      str_lit("expf")},
+				{str_lit("llvm.exp.f64"),      str_lit("exp")},
+				{str_lit("llvm.fmuladd.f32"),  str_lit("fmaf")},
+				{str_lit("llvm.fmuladd.f64"),  str_lit("fma")},
+				// f16 variants have no libm equivalent; left unmapped on purpose.
+			};
+			for (const cgLLVMMathRemap &r : llvm_math_remap) {
+				if (link_name == r.llvm) {
+					return r.libm;
+				}
+			}
+		}
+		return link_name;
 	} else if (e->kind == Entity_Procedure && e->Procedure.is_export) {
 		no_name_mangle = true;
 	}

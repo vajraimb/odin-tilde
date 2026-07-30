@@ -114,6 +114,10 @@ gb_internal cgProcedure *cg_procedure_create(cgModule *m, Entity *entity, bool i
 	p->is_entry_point = false;
 	p->split_returns_index = -1;
 
+	if (p->is_foreign) {
+		cg_add_foreign_library_path(m, entity->Procedure.foreign_library);
+	}
+
 	gbAllocator a = heap_allocator();
 	p->children.allocator      = a;
 

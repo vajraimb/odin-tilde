@@ -1696,8 +1696,18 @@ gb_internal void cg_range_stmt_store_val(cgProcedure *p, Ast *stmt_val, cgValue 
 		return;
 	}
 
-	if (e->flags & EntityFlag_Value) {
-		if (value.kind == cgValue_Addr) {
+	if ((e->flags & EntityFlag_Value) == 0) {
+		// NOTE(odin-tilde): by-reference iteration (flag UNSET, matching
+		// lb_store_range_stmt_val): register the element pointer as the
+		// entity's address directly so that assignments to the loop
+		// variable write through to the iterated element. (This check
+		// was inverted, which routed by-reference vars through the
+		// by-value local-copy path and silently dropped all writes.)
+		// The element may arrive as a lazy address or as an eager load
+		// (cg_build_range_stmt_indexed loads); both recover to the
+		// element pointer here.
+		if (value.kind == cgValue_Addr ||
+		    (value.kind == cgValue_Value && value.node != nullptr && value.node->type == TB_LOAD)) {
 			cgValue ptr = cg_address_from_load_or_generate_local(p, value);
 			cg_add_entity(p->module, e, ptr);
 			return;
