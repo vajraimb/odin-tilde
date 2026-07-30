@@ -36,8 +36,12 @@ gb_internal TB_DataType cg_data_type(Type *t) {
 		case Basic_u32:
 		case Basic_i64:
 		case Basic_u64:
-		case Basic_i128:
-		case Basic_u128:
+
+		// NOTE(odin-tilde): TB has no 128-bit integer type. u128/i128 (and
+		// their endian variants) intentionally fall through to TB_TYPE_VOID
+		// so they are treated as opaque 16-byte aggregates; every arithmetic,
+		// comparison and conversion op on them is lowered limb-wise in
+		// tilde_expr.cpp (see cg_emit_arith_u128).
 
 		case Basic_rune:
 
@@ -63,16 +67,12 @@ gb_internal TB_DataType cg_data_type(Type *t) {
 		case Basic_u32le:
 		case Basic_i64le:
 		case Basic_u64le:
-		case Basic_i128le:
-		case Basic_u128le:
 		case Basic_i16be:
 		case Basic_u16be:
 		case Basic_i32be:
 		case Basic_u32be:
 		case Basic_i64be:
 		case Basic_u64be:
-		case Basic_i128be:
-		case Basic_u128be:
 			return TB_TYPE_INTN(cast(u16)gb_min(8*sz, 64));
 
 		case Basic_f16le: return TB_TYPE_F16;
@@ -211,11 +211,39 @@ gb_internal cgAddr cg_addr_soa_variable(cgValue addr, cgValue index, Ast *index_
 	return v;
 }
 
+gb_internal cgAddr cg_addr_bit_field(cgValue addr, Type *type, i64 bit_offset, u8 bit_size) {
+	GB_ASSERT(is_type_pointer(addr.type));
+	Type *mt = type_deref(addr.type);
+	GB_ASSERT_MSG(is_type_bit_field(mt), "%s", type_to_string(mt));
+
+	cgAddr v = {cgAddr_BitField, addr};
+	v.bitfield.type       = type;
+	v.bitfield.bit_offset = bit_offset;
+	v.bitfield.bit_size   = bit_size;
+	return v;
+}
+
+gb_internal cgAddr cg_addr_swizzle(cgValue addr, Type *type, u8 swizzle_count, u8 swizzle_indices[4]) {
+	GB_ASSERT(is_type_array(type) || is_type_simd_vector(type));
+	GB_ASSERT(1 < swizzle_count && swizzle_count <= 4);
+	cgAddr v = {cgAddr_Swizzle, addr};
+	v.swizzle.type = type;
+	v.swizzle.count = swizzle_count;
+	gb_memmove(v.swizzle.indices, swizzle_indices, swizzle_count);
+	return v;
+}
+
 
 
 gb_internal void cg_set_debug_pos_from_node(cgProcedure *p, Ast *node) {
 	if (node) {
 		TokenPos pos = ast_token(node).pos;
+		// PATCH(odin-tilde): synthesized AST nodes (e.g. inside generated
+		// equal/hasher procs) can carry file_id 0, which is not a valid
+		// key in file_id_map (ptr_map panics on a 0 key).
+		if (pos.file_id == 0) {
+			return;
+		}
 		TB_SourceFile **file = map_get(&p->module->file_id_map, cast(uintptr)pos.file_id);
 		if (file) {
 			tb_inst_location(p->func, *file, pos.line, pos.column);

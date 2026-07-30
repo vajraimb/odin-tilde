@@ -394,7 +394,9 @@ gb_internal isize cg_global_const_calculate_region_count(ExactValue const &value
 		Type *bt = base_type(type);
 		switch (bt->kind) {
 		case Type_Struct:
-			if (cl->elems[0]->kind == Ast_FieldValue) {
+			// PATCH(odin-tilde): empty compound literals (`T{}`) have no
+			// elems to inspect — guard before peeking at elems[0].
+			if (cl->elems.count > 0 && cl->elems[0]->kind == Ast_FieldValue) {
 				for (isize i = 0; i < cl->elems.count; i++) {
 					ast_node(fv, FieldValue, cl->elems[i]);
 					InternedString name = fv->field->Ident.interned;
@@ -952,6 +954,29 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 		return cg_addr_load(p, tmp);
 	}
 
+	// PATCH(odin-tilde): scalar splat constant of array type (mirrors
+	// lb_const_array_spread) — in array arithmetic the checker types a scalar
+	// operand constant as the whole array (e.g. the `2` in `x / 2` where
+	// x: [3]f32 has type [3]f32 with value Integer(2)); replicate the scalar
+	// into every element instead of writing the integer's raw bytes into an
+	// aggregate rodata blob.
+	if (is_type_array(type) &&
+	    value.kind != ExactValue_Invalid &&
+	    value.kind != ExactValue_String &&
+	    value.kind != ExactValue_Compound) {
+		Type *bt = base_type(type);
+		Type *et = bt->Array.elem;
+		i64 count = bt->Array.count;
+		cgValue ev = cg_const_value(p, et, value);
+		cgAddr tmp = cg_add_local(p, type, nullptr, true);
+		cgValue base = cg_value(cg_addr_get_ptr(p, tmp).node, alloc_type_pointer(et));
+		for (i64 i = 0; i < count; i++) {
+			cgValue ep = cg_emit_ptr_offset(p, base, cg_value(tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)i), t_int));
+			cg_emit_store(p, ep, ev);
+		}
+		return cg_addr_load(p, tmp);
+	}
+
 	switch (value.kind) {
 	case ExactValue_Invalid:
 		return cg_const_nil(p, type);
@@ -990,7 +1015,34 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 		return cg_value(tb_inst_uint(p->func, dt, value.value_bool), type);
 
 	case ExactValue_Integer:
-		GB_ASSERT(!TB_IS_VOID_TYPE(dt));
+		if (is_type_float(type)) {
+			// PATCH(odin-tilde): an untyped integer constant in a float context
+			// (e.g. the `2` in `x / 2` where x: [3]f32) keeps ExactValue_Integer
+			// with a float type — emit a float constant rather than an integer
+			// constant node whose bits get reinterpreted (2 -> 2.8e-45).
+			f64 f = big_int_to_f64(&value.value_integer);
+			if (type_size_of(type) == 8) {
+				return cg_value(tb_inst_float64(p->func, f), type);
+			}
+			return cg_value(tb_inst_float32(p->func, cast(f32)f), type);
+		}
+		if (TB_IS_VOID_TYPE(dt)) {
+			// NOTE(odin-tilde): integer constant with an aggregate type
+			// (e.g. a u16 magic transmuted to [2]u8 in compress): the value
+			// cannot be a single TB node, so materialize it into rodata and
+			// hand back its address (same idiom as ExactValue_Compound).
+			cgModule *m = p->module;
+			char name[32] = {};
+			gb_snprintf(name, 31, "aggint$%u", 1+m->const_nil_guid.fetch_add(1));
+			TB_Global *g = tb_global_create(m->mod, -1, name, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
+			i64 size = type_size_of(type);
+			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), g, size, type_align_of(type), 1);
+			void *data = tb_global_add_region(m->mod, g, 0, size);
+			cg_write_big_int_at_ptr(data, &value.value_integer, type);
+			TB_Node *s = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)g);
+			return cg_lvalue_addr(s, type);
+		}
+		GB_ASSERT_MSG(!TB_IS_VOID_TYPE(dt), "type %s", type_to_string(type));
 		// GB_ASSERT(dt.raw != TB_TYPE_I128.raw);
 		if (is_type_unsigned(type)) {
 			u64 i = 0;
@@ -1008,10 +1060,15 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 
 	case ExactValue_Float:
 		GB_ASSERT(!TB_IS_VOID_TYPE(dt));
-		GB_ASSERT(dt.raw != TB_TYPE_F16.raw);
 		GB_ASSERT(!is_type_different_to_arch_endianness(type));
 		{
 			f64 f = exact_value_to_f64(value);
+			if (dt.raw == TB_TYPE_F16.raw) {
+				// NOTE(odin-tilde): f16 is an I16 bit pattern; fold the
+				// constant host-side (same as composite constants below).
+				u16 u = f32_to_f16(cast(f32)f);
+				return cg_value(tb_inst_uint(p->func, dt, u), type);
+			}
 			if (type_size_of(type) == 8) {
 				return cg_value(tb_inst_float64(p->func, f), type);
 			} else {
@@ -1055,6 +1112,22 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 
 		}
 
+	case ExactValue_Complex:
+	case ExactValue_Quaternion:
+		{
+			// NOTE(odin-tilde): no single TB node can hold these; write the
+			// value into a rodata global and hand back its address (same
+			// idiom as ExactValue_Compound).
+			cgModule *m = p->module;
+			char name[32] = {};
+			gb_snprintf(name, 31, "cq$%u", 1+m->const_nil_guid.fetch_add(1));
+			TB_Global *g = tb_global_create(m->mod, -1, name, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
+			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), g, type_size_of(type), type_align_of(type), 1);
+			cg_global_const_add_region(m, value, type, g, 0);
+			TB_Node *s = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)g);
+			return cg_lvalue_addr(s, type);
+		}
+
 	case ExactValue_Pointer:
 		return cg_value(tb_inst_uint(p->func, dt, exact_value_to_u64(value)), type);
 
@@ -1068,7 +1141,7 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 	}
 
 
-	GB_ASSERT(node != nullptr);
+	GB_ASSERT_MSG(node != nullptr, "cg_const_value: unhandled value kind %d for type %s", value.kind, type_to_string(type));
 	return cg_value(node, type);
 }
 

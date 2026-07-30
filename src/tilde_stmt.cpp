@@ -199,16 +199,9 @@ gb_internal cgValue cg_address_from_load(cgProcedure *p, cgValue value) {
 }
 
 gb_internal bool cg_addr_is_empty(cgAddr const &addr) {
-	switch (addr.kind) {
-	case cgValue_Value:
-	case cgValue_Addr:
-		return addr.addr.node == nullptr;
-	case cgValue_Symbol:
-		return addr.addr.symbol == nullptr;
-	case cgValue_Multi:
-		return addr.addr.multi == nullptr;
-	}
-	return true;
+	// NOTE: every cgAddrKind carries its base address in `addr.addr`;
+	// the cgValue is empty when it holds neither a node nor a symbol.
+	return addr.addr.node == nullptr && addr.addr.symbol == nullptr;
 }
 
 gb_internal Type *cg_addr_type(cgAddr const &addr) {
@@ -216,6 +209,8 @@ gb_internal Type *cg_addr_type(cgAddr const &addr) {
 		return nullptr;
 	}
 	switch (addr.kind) {
+	case cgAddr_BitField:
+		return addr.bitfield.type;
 	case cgAddr_Map:
 		{
 			Type *t = base_type(addr.map.type);
@@ -250,6 +245,83 @@ gb_internal cgValue cg_addr_load(cgProcedure *p, cgAddr addr) {
 	switch (addr.kind) {
 	case cgAddr_Default:
 		return cg_emit_load(p, addr.addr);
+
+	case cgAddr_BitField:
+		{
+			// NOTE(odin-tilde): simplified bit-field read — the backing
+			// must fit in 64 bits; the whole backing is loaded and the
+			// field extracted with shifts/masks, sign-extended for signed
+			// field types. Backing arrays/larger integers are TODO.
+			Type *bft = base_type(type_deref(addr.addr.type));
+			GB_ASSERT(bft->kind == Type_BitField);
+			i64 size = type_size_of(bft);
+			Type *it = nullptr;
+			switch (size) {
+			case 1: it = t_u8;  break;
+			case 2: it = t_u16; break;
+			case 4: it = t_u32; break;
+			case 8: it = t_u64; break;
+			default: GB_PANIC("TODO(bill): bit_field backing size %lld", cast(long long)size);
+			}
+			cgValue raw = cg_emit_load(p, cg_value(addr.addr.node, alloc_type_pointer(it)));
+			raw = cg_emit_conv(p, raw, t_u64);
+			i64 off   = addr.bitfield.bit_offset;
+			i64 nbits = addr.bitfield.bit_size;
+			cgValue res = {};
+			if (!is_type_unsigned(addr.bitfield.type)) {
+				// sign-extend from bit (off + nbits - 1): shift into the
+				// sign position, then arithmetic-shift back down. The
+				// t_i64 domain makes Token_Shr emit an arithmetic shift.
+				cgValue sv = cg_emit_conv(p, raw, t_i64);
+				cgValue v = cg_emit_arith(p, Token_Shl, sv, cg_const_int(p, t_i64, 64 - (off + nbits)), t_i64);
+				res = cg_emit_arith(p, Token_Shr, v, cg_const_int(p, t_i64, 64 - nbits), t_i64);
+			} else {
+				u64 mask = nbits >= 64 ? ~0ull : ((1ull << nbits) - 1);
+				cgValue v = cg_emit_arith(p, Token_Shr, raw, cg_const_int(p, t_u64, off), t_u64);
+				res = cg_emit_arith(p, Token_And, v, cg_const_int(p, t_u64, cast(i64)mask), t_u64);
+			}
+			return cg_emit_conv(p, res, addr.bitfield.type);
+		}
+
+	case cgAddr_Context:
+		{
+			// NOTE(odin-tilde): mirrors lb_addr_load's lbAddr_Context path
+			cgValue a = addr.addr;
+			for_array(i, p->context_stack) {
+				cgContextData *ctx_data = &p->context_stack[i];
+				if (ctx_data->ctx.addr.node == a.node) {
+					ctx_data->uses += 1;
+					break;
+				}
+			}
+			a = cg_emit_conv(p, a, t_context_ptr);
+			if (addr.ctx.sel.index.count > 0) {
+				cgValue b = cg_emit_deep_field_gep(p, a, addr.ctx.sel);
+				return cg_emit_load(p, b);
+			}
+			return cg_emit_load(p, a);
+		}
+
+	case cgAddr_Swizzle:
+		{
+			// NOTE(odin-tilde): gather the swizzled elements into a temporary
+			// array (LLVM does the same modulo a vector fast path).
+			Type *array_type = base_type(addr.swizzle.type);
+			if (array_type->kind == Type_SimdVector) {
+				GB_PANIC("TODO(bill): cgAddr_Swizzle for #simd");
+			}
+			GB_ASSERT(array_type->kind == Type_Array);
+
+			cgAddr res = cg_add_local(p, addr.swizzle.type, nullptr, true);
+			cgValue ptr = cg_addr_get_ptr(p, res);
+			for (u8 i = 0; i < addr.swizzle.count; i++) {
+				u8 index = addr.swizzle.indices[i];
+				cgValue dst = cg_emit_array_epi(p, ptr, i);
+				cgValue src = cg_emit_array_epi(p, addr.addr, index);
+				cg_emit_store(p, dst, cg_emit_load(p, src));
+			}
+			return cg_addr_load(p, res);
+		}
 
 	case cgAddr_Map:
 		{
@@ -322,8 +394,11 @@ gb_internal cgValue cg_addr_load(cgProcedure *p, cgAddr addr) {
 				}
 				for (isize i = 0; i < field_count; i++) {
 					Entity *field = t->Struct.fields[i];
-					Type *base_type = field->type;
-					GB_ASSERT(base_type->kind == Type_Pointer);
+					Type *field_bt = base_type(field->type);
+					// PATCH(odin-tilde): #soa structs may hold multi-pointer
+					// fields too (e.g. cbor's `name: [^]string`); ptr_offset
+					// handles both pointer kinds.
+					GB_ASSERT_MSG(field_bt->kind == Type_Pointer || field_bt->kind == Type_MultiPointer, "field %.*s: %s (in %.*s)", LIT(field->token.string), type_to_string(field_bt), LIT(p->name));
 
 					cgValue dst = cg_emit_struct_ep(p, res.addr, cast(i32)i);
 					cgValue src_ptr = cg_emit_struct_ep(p, addr.addr, cast(i32)i);
@@ -337,7 +412,7 @@ gb_internal cgValue cg_addr_load(cgProcedure *p, cgAddr addr) {
 			return cg_addr_load(p, res);
 		}
 	}
-	GB_PANIC("TODO(bill): cg_addr_load %p", addr.addr.node);
+	GB_PANIC("TODO(bill): cg_addr_load kind=%d node=%p", addr.kind, addr.addr.node);
 	return {};
 }
 
@@ -405,13 +480,109 @@ gb_internal void cg_addr_store(cgProcedure *p, cgAddr addr, cgValue value) {
 			cg_emit_store(p, lhs, rhs);
 		}
 		return;
+	} else if (addr.kind == cgAddr_BitField) {
+		// NOTE(odin-tilde): read-modify-write of the bit_field backing
+		// (same 64-bit limitation as the load path).
+		Type *bft = base_type(type_deref(addr.addr.type));
+		GB_ASSERT(bft->kind == Type_BitField);
+		i64 size = type_size_of(bft);
+		Type *it = nullptr;
+		switch (size) {
+		case 1: it = t_u8;  break;
+		case 2: it = t_u16; break;
+		case 4: it = t_u32; break;
+		case 8: it = t_u64; break;
+		default: GB_PANIC("TODO(bill): bit_field backing size %lld", cast(long long)size);
+		}
+		cgValue dst = cg_value(addr.addr.node, alloc_type_pointer(it));
+		i64 off   = addr.bitfield.bit_offset;
+		i64 nbits = addr.bitfield.bit_size;
+		u64 mask = nbits >= 64 ? ~0ull : ((1ull << nbits) - 1);
+		u64 field_mask = mask << off;
+
+		cgValue old = cg_emit_conv(p, cg_emit_load(p, dst), t_u64);
+		cgValue val = cg_emit_conv(p, value, addr.bitfield.type);
+		val = cg_emit_conv(p, val, t_u64);
+		cgValue shifted = cg_emit_arith(p, Token_Shl, val, cg_const_int(p, t_u64, off), t_u64);
+		shifted = cg_emit_arith(p, Token_And, shifted, cg_const_int(p, t_u64, cast(i64)field_mask), t_u64);
+		cgValue cleared = cg_emit_arith(p, Token_And, old, cg_const_int(p, t_u64, cast(i64)~field_mask), t_u64);
+		cgValue merged = cg_emit_arith(p, Token_Or, cleared, shifted, t_u64);
+		merged = cg_emit_conv(p, merged, it);
+		cg_emit_store(p, dst, merged);
+		return;
 	} else if (addr.kind == cgAddr_SoaVariable) {
-		GB_PANIC("TODO(bill): cgAddr_SoaVariable");
+		// NOTE(odin-tilde): mirrors lb_addr_store's SoaVariable branch;
+		// field walking matches cg_addr_load's SoaVariable branch above.
+		Type *t = type_deref(addr.addr.type);
+		t = base_type(t);
+		GB_ASSERT(t->kind == Type_Struct && t->Struct.soa_kind != StructSoa_None);
+		Type *elem_type = t->Struct.soa_elem;
+		value = cg_emit_conv(p, value, elem_type);
+		cgValue src_addr = cg_address_from_load_or_generate_local(p, value);
+
+		if (t->Struct.soa_kind == StructSoa_Fixed) {
+			for_array(i, t->Struct.fields) {
+				cgValue dst = cg_emit_struct_ep(p, addr.addr, cast(i32)i);
+				dst = cg_emit_array_ep(p, dst, addr.soa.index);
+				cgValue src = cg_emit_load(p, cg_emit_struct_ep(p, src_addr, cast(i32)i));
+				cg_emit_store(p, dst, src);
+			}
+		} else {
+			isize field_count = t->Struct.fields.count;
+			if (t->Struct.soa_kind == StructSoa_Slice) {
+				field_count -= 1;
+			} else if (t->Struct.soa_kind == StructSoa_Dynamic) {
+				field_count -= 3;
+			}
+			for (isize i = 0; i < field_count; i++) {
+				cgValue dst = cg_emit_struct_ep(p, addr.addr, cast(i32)i);
+				dst = cg_emit_load(p, dst);
+				dst = cg_emit_ptr_offset(p, dst, addr.soa.index);
+				cgValue src = cg_emit_load(p, cg_emit_struct_ep(p, src_addr, cast(i32)i));
+				cg_emit_store(p, dst, src);
+			}
+		}
+		return;
 	} else if (addr.kind == cgAddr_Swizzle) {
 		GB_ASSERT(addr.swizzle.count <= 4);
-		GB_PANIC("TODO(bill): cgAddr_Swizzle");
+
+		GB_ASSERT(value.node != nullptr);
+		value = cg_emit_conv(p, value, cg_addr_type(addr));
+
+		cgValue dst = addr.addr;
+		cgValue src = cg_address_from_load_or_generate_local(p, value);
+		{
+			cgValue src_ptrs[4] = {};
+			cgValue src_loads[4] = {};
+			cgValue dst_ptrs[4] = {};
+
+			for (u8 i = 0; i < addr.swizzle.count; i++) {
+				src_ptrs[i] = cg_emit_array_epi(p, src, i);
+			}
+			for (u8 i = 0; i < addr.swizzle.count; i++) {
+				dst_ptrs[i] = cg_emit_array_epi(p, dst, addr.swizzle.indices[i]);
+			}
+			for (u8 i = 0; i < addr.swizzle.count; i++) {
+				src_loads[i] = cg_emit_load(p, src_ptrs[i]);
+			}
+			for (u8 i = 0; i < addr.swizzle.count; i++) {
+				cg_emit_store(p, dst_ptrs[i], src_loads[i]);
+			}
+		}
+		return;
 	} else if (addr.kind == cgAddr_SwizzleLarge) {
-		GB_PANIC("TODO(bill): cgAddr_SwizzleLarge");
+		GB_ASSERT(value.node != nullptr);
+		value = cg_emit_conv(p, value, cg_addr_type(addr));
+
+		cgValue dst = addr.addr;
+		cgValue src = cg_address_from_load_or_generate_local(p, value);
+		for_array(i, addr.swizzle_large.indices) {
+			cgValue src_ptr = cg_emit_array_epi(p, src, i);
+			cgValue dst_ptr = cg_emit_array_epi(p, dst, addr.swizzle_large.indices[i]);
+			cgValue src_load = cg_emit_load(p, src_ptr);
+			cg_emit_store(p, dst_ptr, src_load);
+		}
+		return;
 	}
 
 	value = cg_emit_conv(p, value, cg_addr_type(addr));
@@ -478,6 +649,37 @@ gb_internal cgValue cg_emit_array_ep(cgProcedure *p, cgValue s, cgValue index) {
 }
 gb_internal cgValue cg_emit_array_epi(cgProcedure *p, cgValue s, i64 index) {
 	return cg_emit_array_ep(p, s, cg_const_int(p, t_int, index));
+}
+
+gb_internal cgValue cg_emit_matrix_ep(cgProcedure *p, cgValue s, cgValue row, cgValue column) {
+	// NOTE(odin-tilde): mirrors lb_emit_matrix_ep.
+	s = cg_flatten_value(p, s);
+	GB_ASSERT(s.kind == cgValue_Value);
+
+	Type *t = s.type;
+	GB_ASSERT_MSG(is_type_pointer(t), "%s", type_to_string(t));
+	Type *mt = base_type(type_deref(t));
+	GB_ASSERT_MSG(is_type_matrix(mt), "%s", type_to_string(mt));
+
+	Type *elem = base_array_type(mt);
+	i64 stride = type_size_of(elem);
+	i64 stride_elems = matrix_type_stride_in_elems(mt);
+
+	row    = cg_emit_conv(p, row, t_int);
+	column = cg_emit_conv(p, column, t_int);
+
+	cgValue index = {};
+	if (mt->Matrix.is_row_major) {
+		index = cg_emit_arith(p, Token_Add, column, cg_emit_arith(p, Token_Mul, row, cg_const_int(p, t_int, stride_elems), t_int), t_int);
+	} else {
+		index = cg_emit_arith(p, Token_Add, row, cg_emit_arith(p, Token_Mul, column, cg_const_int(p, t_int, stride_elems), t_int), t_int);
+	}
+
+	GB_ASSERT_MSG(s.node->dt.type == TB_TAG_PTR, "matrix_ep base not PTR: %s (in %.*s)", type_to_string(t), LIT(p->name));
+	return cg_value(tb_inst_array_access(p->func, s.node, index.node, stride), alloc_type_pointer(elem));
+}
+gb_internal cgValue cg_emit_matrix_epi(cgProcedure *p, cgValue s, i64 row, i64 column) {
+	return cg_emit_matrix_ep(p, s, cg_const_int(p, t_int, row), cg_const_int(p, t_int, column));
 }
 
 
@@ -900,6 +1102,20 @@ gb_internal cgValue cg_address_from_load_or_generate_local(cgProcedure *p, cgVal
 }
 
 
+// NOTE(odin-tilde): mirror lb_add_defer_proc — used for @(deferred_in/out=...)
+// procedure attributes; registers the associated deferred procedure call on
+// the caller's scope.
+gb_internal void cg_add_defer_proc(cgProcedure *p, isize scope_index, cgValue deferred, Slice<cgValue> const &result_as_args) {
+	cgDefer *d = array_add_and_get(&p->defer_stack);
+	d->kind = cgDefer_Proc;
+	d->scope_index = scope_index;
+	d->context_stack_count = p->context_stack.count;
+	d->control_region = tb_inst_get_control(p->func);
+	GB_ASSERT(d->control_region != nullptr);
+	d->proc.deferred = deferred;
+	d->proc.result_as_args = result_as_args;
+}
+
 gb_internal void cg_build_defer_stmt(cgProcedure *p, cgDefer const &d) {
 	TB_Node *curr_region = tb_inst_get_control(p->func);
 	if (curr_region == nullptr) {
@@ -996,6 +1212,16 @@ gb_internal isize cg_append_tuple_values(cgProcedure *p, Array<cgValue> *dst_val
 	isize init_count = dst_values->count;
 	Type *t = src_value.type;
 	if (t && t->kind == Type_Tuple) {
+		if (src_value.kind != cgValue_Multi) {
+			// NOTE(odin-tilde): a materialized tuple (e.g. the try lhs of
+			// `a, b := f() or_break`, which cg_emit_conv stores into a
+			// local) — explode it by loading each field.
+			cgValue tp = cg_address_from_load_or_generate_local(p, src_value);
+			for (i32 i = 0; i < t->Tuple.variables.count; i++) {
+				array_add(dst_values, cg_emit_load(p, cg_emit_struct_ep(p, tp, i)));
+			}
+			return dst_values->count - init_count;
+		}
 		GB_ASSERT(src_value.kind == cgValue_Multi);
 		GB_ASSERT(src_value.multi != nullptr);
 		GB_ASSERT(src_value.multi->values.count == t->Tuple.variables.count);
@@ -1044,14 +1270,28 @@ gb_internal void cg_build_assignment(cgProcedure *p, Array<cgAddr> const &lvals,
 
 		Type *type = cg_addr_type(lval);
 		if (!cg_addr_is_empty(lval)) {
-			GB_ASSERT_MSG(are_types_identical(init.type, type), "%s = %s", type_to_string(init.type), type_to_string(type));
+			// PATCH(odin-tilde): multi-assignments allow implicit conversions
+			// (e.g. `buf, err = make(...)` binding Allocator_Error into a
+			// union return like base64.Error), so convert instead of
+			// requiring identical types.
+			if (!are_types_identical(init.type, type)) {
+				init = cg_flatten_value(p, cg_emit_conv(p, init, type));
+			}
 		}
 
-		if (init.kind == cgValue_Addr &&
-		    !cg_addr_is_empty(lval)) {
+		if (!cg_addr_is_empty(lval)) {
 			// NOTE(bill): This is needed for certain constructs such as this:
 			// a, b = b, a
 			// NOTE(bill): This is a bodge and not necessarily a good way of doing things whatsoever
+			// PATCH(odin-tilde): apply the copy to scalars too, not just
+			// aggregates — a TB load node is a value that can be re-scheduled
+			// after the first store, which made `a.used, b.used = b.used, a.used`
+			// read the NEW value (broke math/big's internal_swap). Routing every
+			// RHS through a memory copy keeps the reads pinned before the stores.
+			if (init.kind != cgValue_Addr) {
+				init = cg_value(cg_address_from_load_or_generate_local(p, init).node, init.type);
+				init.kind = cgValue_Addr;
+			}
 			TB_CharUnits size  = cast(TB_CharUnits)type_size_of(type);
 			TB_CharUnits align = cast(TB_CharUnits)type_align_of(type);
 			TB_Node *copy = tb_inst_local(p->func, size, align);
@@ -1122,11 +1362,9 @@ gb_internal void cg_build_assign_stmt(cgProcedure *p, AstAssignStmt *as) {
 			// return;
 		}
 
-		if (is_type_array(lhs_type)) {
-			GB_PANIC("TODO(bill): cg_build_assign_stmt_array");
-			// cg_build_assign_stmt_array(p, op, lhs, value);
-			// return;
-		} else {
+		// NOTE(odin-tilde): arrays flow through the generic path —
+		// cg_emit_arith handles array-like operands element-wise.
+		{
 			cgValue old_value = cg_addr_load(p, lhs);
 			Type *type = old_value.type;
 
@@ -1150,6 +1388,9 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 	isize return_count = p->type->Proc.result_count;
 
 	if (return_count == 0) {
+		// NOTE(odin-tilde): mirror lb — defers run after the return value is
+		// computed but before the actual ret (e.g. @(deferred_in=) guards).
+		cg_emit_defer_stmts(p, cgDeferExit_Return, nullptr);
 		tb_inst_ret(p->func, 0, nullptr);
 		return;
 	}
@@ -1170,6 +1411,7 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 			cgValue ptr = cg_value(ret_ptr, alloc_type_pointer(e->type));
 			cg_emit_store(p, ptr, results[return_count-1]);
 
+			cg_emit_defer_stmts(p, cgDeferExit_Return, nullptr);
 			tb_inst_ret(p->func, 0, nullptr);
 			return;
 		} else {
@@ -1181,7 +1423,17 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 			TB_Node *final_res = nullptr;
 			if (result.kind == cgValue_Addr) {
 				TB_CharUnits align = cast(TB_CharUnits)type_align_of(result.type);
-				final_res = tb_inst_load(p->func, dt, result.node, align, false);
+				i64 rsz = type_size_of(result.type);
+				if (rsz <= 8 && rsz != 1 && rsz != 2 && rsz != 4 && rsz != 8) {
+					// odd-sized aggregate: compose the blob from chunk loads
+					// so we never read past the object
+					final_res = cg_load_gpr_blob(p, result.node, rsz, align);
+					if (final_res->dt.raw != dt.raw) {
+						final_res = tb_inst_bitcast(p->func, final_res, dt);
+					}
+				} else {
+					final_res = tb_inst_load(p->func, dt, result.node, align, false);
+				}
 			} else {
 				GB_ASSERT(result.kind == cgValue_Value);
 				TB_DataType st = result.node->dt;
@@ -1197,6 +1449,7 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 			}
 			GB_ASSERT(final_res != nullptr);
 
+			cg_emit_defer_stmts(p, cgDeferExit_Return, nullptr);
 			tb_inst_ret(p->func, 1, &final_res);
 			return;
 		}
@@ -1210,6 +1463,7 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 			cgValue ptr = cg_value(ret_ptr, alloc_type_pointer(e->type));
 			cg_emit_store(p, ptr, results[return_count-1]);
 
+			cg_emit_defer_stmts(p, cgDeferExit_Return, nullptr);
 			tb_inst_ret(p->func, 0, nullptr);
 			return;
 		} else {
@@ -1222,7 +1476,17 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 				TB_Node *final_res = nullptr;
 				if (result.kind == cgValue_Addr) {
 					TB_CharUnits align = cast(TB_CharUnits)type_align_of(result.type);
-					final_res = tb_inst_load(p->func, dt, result.node, align, false);
+					i64 rsz = type_size_of(result.type);
+					if (rsz <= 8 && rsz != 1 && rsz != 2 && rsz != 4 && rsz != 8) {
+						// odd-sized aggregate: compose the blob from chunk
+						// loads so we never read past the object
+						final_res = cg_load_gpr_blob(p, result.node, rsz, align);
+						if (final_res->dt.raw != dt.raw) {
+							final_res = tb_inst_bitcast(p->func, final_res, dt);
+						}
+					} else {
+						final_res = tb_inst_load(p->func, dt, result.node, align, false);
+					}
 				} else {
 					GB_ASSERT(result.kind == cgValue_Value);
 					TB_DataType st = result.node->dt;
@@ -1239,6 +1503,7 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 
 				GB_ASSERT(final_res != nullptr);
 
+				cg_emit_defer_stmts(p, cgDeferExit_Return, nullptr);
 				tb_inst_ret(p->func, 1, &final_res);
 				return;
 			} else {
@@ -1256,6 +1521,8 @@ gb_internal void cg_build_return_stmt(cgProcedure *p, Slice<Ast *> const &return
 	isize return_count = p->type->Proc.result_count;
 
 	if (return_count == 0) {
+		// NOTE(odin-tilde): mirror lb — defers still run for bare `return`.
+		cg_emit_defer_stmts(p, cgDeferExit_Return, nullptr);
 		tb_inst_ret(p->func, 0, nullptr);
 		return;
 	}
@@ -1278,17 +1545,25 @@ gb_internal void cg_build_return_stmt(cgProcedure *p, Slice<Ast *> const &return
 	}
 	GB_ASSERT(results.count == return_count);
 
+	for_array(i, tuple->variables) {
+		Entity *e = tuple->variables[i];
+		results[i] = cg_emit_conv(p, results[i], e->type);
+	}
 	if (return_results.count != 0 && p->type->Proc.has_named_results) {
 		// NOTE(bill): store the named values before returning
+		// NOTE(odin-tilde): the return expressions may reference the named
+		// result variables themselves (`return b, a`) — snapshot every value
+		// into a temporary first, otherwise earlier stores clobber later reads.
+		for_array(i, tuple->variables) {
+			cgAddr tmp = cg_add_local(p, results[i].type, nullptr, false);
+			cg_addr_store(p, tmp, results[i]);
+			results[i] = cg_addr_load(p, tmp);
+		}
 		for_array(i, tuple->variables) {
 			Entity *e = tuple->variables[i];
 			cgAddr addr = map_must_get(&p->variable_map, e);
 			cg_addr_store(p, addr, results[i]);
 		}
-	}
-	for_array(i, tuple->variables) {
-		Entity *e = tuple->variables[i];
-		results[i] = cg_emit_conv(p, results[i], e->type);
 	}
 
 	cg_build_return_stmt_internal(p, slice_from_array(results));
@@ -2189,9 +2464,8 @@ gb_internal void cg_build_range_stmt(cgProcedure *p, Ast *node) {
 		}
 		case Type_BitSet: {
 			// for x in bit_set: iterate set bits via ctz (LLVM parity).
-			// NOTE(tilde): 128-bit bit_sets only iterate the low 64 bits
-			// because new TB has no i128 (same limitation as the rest of
-			// this backend's u128 handling).
+			// NOTE(odin-tilde): 128-bit backings (u128) are aggregates in
+			// this backend; the loop body takes ctz across both limbs.
 			if (rs->reverse) {
 				GB_PANIC("TODO(bill): reverse bit_set range");
 			}
@@ -2223,7 +2497,22 @@ gb_internal void cg_build_range_stmt(cgProcedure *p, Ast *node) {
 
 			tb_inst_set_control(p->func, body);
 
-			val = cg_value(tb_inst_ctz(p->func, remaining_val.node), mask);
+			if (type_size_of(mask) == 16) {
+				// NOTE(odin-tilde): 128-bit backing (u128) is an aggregate
+				// here — take ctz across both limbs.
+				bool mswap = cg_u128_is_swapped(mask);
+				TB_Node *ap = cg_u128_addr_of(p, remaining_val);
+				TB_Node *lo = cg_emit_u128_limb_load(p, ap, mswap, 0);
+				TB_Node *hi = cg_emit_u128_limb_load(p, ap, mswap, 1);
+				TB_Node *zero64 = tb_inst_uint(p->func, TB_TYPE_I64, 0);
+				TB_Node *ctz_lo = tb_inst_zxt(p->func, tb_inst_ctz(p->func, lo), TB_TYPE_I64);
+				TB_Node *ctz_hi = tb_inst_zxt(p->func, tb_inst_ctz(p->func, hi), TB_TYPE_I64);
+				ctz_hi = tb_inst_add(p->func, ctz_hi, tb_inst_uint(p->func, TB_TYPE_I64, 64), cast(TB_ArithmeticBehavior)0);
+				TB_Node *idx = tb_inst_select(p->func, tb_inst_cmp_ne(p->func, lo, zero64), ctz_lo, ctz_hi);
+				val = cg_value(idx, t_u64);
+			} else {
+				val = cg_value(tb_inst_ctz(p->func, remaining_val.node), mask);
+			}
 			val = cg_emit_conv(p, val, elem);
 			val = cg_emit_arith(p, Token_Add, val, cg_const_int(p, elem, et->BitSet.lower), elem);
 
@@ -2909,6 +3198,146 @@ gb_internal void cg_build_mutable_value_decl(cgProcedure *p, Ast *node) {
 }
 
 
+gb_internal void cg_build_unroll_range_stmt(cgProcedure *p, AstUnrollRangeStmt *rs, Scope *scope) {
+	// NOTE(odin-tilde): mirrors lb_build_unroll_range_stmt. Only the
+	// compile-time full-unroll forms are supported (constant range, enum,
+	// constant string, array, enumerated array); the #unroll(N) runtime
+	// partial-unroll form is not (it is a pure optimization hint).
+	cg_scope_open(p, scope); // Open scope here
+
+	if (rs->init != nullptr) {
+		cg_build_stmt(p, rs->init);
+	}
+
+	Ast *val0 = cg_strip_and_prefix(rs->val0);
+	Ast *val1 = cg_strip_and_prefix(rs->val1);
+	Type *val0_type = nullptr;
+	Type *val1_type = nullptr;
+	if (val0 != nullptr && !is_blank_ident(val0)) {
+		val0_type = type_of_expr(val0);
+	}
+	if (val1 != nullptr && !is_blank_ident(val1)) {
+		val1_type = type_of_expr(val1);
+	}
+
+	if (val0_type != nullptr) {
+		Entity *e = entity_of_node(val0);
+		cg_add_local(p, e->type, e, true);
+	}
+	if (val1_type != nullptr) {
+		Entity *e = entity_of_node(val1);
+		cg_add_local(p, e->type, e, true);
+	}
+
+	Ast *expr = unparen_expr(rs->expr);
+	TypeAndValue tav = type_and_value_of_expr(expr);
+
+	cgAddr val0_addr = {};
+	cgAddr val1_addr = {};
+	if (val0_type) val0_addr = cg_build_addr(p, val0);
+	if (val1_type) val1_addr = cg_build_addr(p, val1);
+
+	if (is_ast_range(expr)) {
+		TokenKind op = expr->BinaryExpr.op.kind;
+		Ast *start_expr = expr->BinaryExpr.left;
+		Ast *end_expr   = expr->BinaryExpr.right;
+		GB_ASSERT(start_expr->tav.mode == Addressing_Constant);
+		GB_ASSERT(end_expr->tav.mode == Addressing_Constant);
+
+		ExactValue start = start_expr->tav.value;
+		ExactValue end   = end_expr->tav.value;
+		TokenKind cmp = op != Token_RangeHalf ? Token_LtEq : Token_Lt;
+		ExactValue index = exact_value_i64(0);
+		for (ExactValue val = start;
+		     compare_exact_values(cmp, val, end);
+		     val = exact_value_increment_one(val), index = exact_value_increment_one(index)) {
+
+			if (val0_type) cg_addr_store(p, val0_addr, cg_const_value(p, val0_type, val));
+			if (val1_type) cg_addr_store(p, val1_addr, cg_const_value(p, val1_type, index));
+
+			cg_build_stmt(p, rs->body);
+		}
+	} else if (tav.mode == Addressing_Type) {
+		GB_ASSERT(is_type_enum(type_deref(tav.type)));
+		Type *et = type_deref(tav.type);
+		Type *bet = base_type(et);
+
+		for_array(i, bet->Enum.fields) {
+			Entity *field = bet->Enum.fields[i];
+			GB_ASSERT(field->kind == Entity_Constant);
+			if (val0_type) cg_addr_store(p, val0_addr, cg_const_value(p, val0_type, field->Constant.value));
+			if (val1_type) cg_addr_store(p, val1_addr, cg_const_value(p, val1_type, exact_value_i64(i)));
+
+			cg_build_stmt(p, rs->body);
+		}
+	} else {
+		GB_ASSERT_MSG(rs->args.count == 0, "TODO(bill): #unroll(N) partial unroll in tilde backend");
+
+		Type *t = base_type(expr->tav.type);
+
+		switch (t->kind) {
+		case Type_Basic:
+			GB_ASSERT(expr->tav.mode == Addressing_Constant);
+			GB_ASSERT(is_type_string(t));
+			{
+				ExactValue value = expr->tav.value;
+				GB_ASSERT(value.kind == ExactValue_String);
+				String str = value.value_string;
+				Rune codepoint = 0;
+				isize offset = 0;
+				do {
+					isize width = utf8_decode(str.text+offset, str.len-offset, &codepoint);
+					if (val0_type) cg_addr_store(p, val0_addr, cg_const_value(p, val0_type, exact_value_i64(codepoint)));
+					if (val1_type) cg_addr_store(p, val1_addr, cg_const_value(p, val1_type, exact_value_i64(offset)));
+					cg_build_stmt(p, rs->body);
+
+					offset += width;
+				} while (offset < str.len);
+			}
+			break;
+		case Type_Array:
+			if (t->Array.count > 0) {
+				cgValue val = cg_build_expr(p, expr);
+				cgValue val_addr = cg_address_from_load_or_generate_local(p, val);
+
+				for (i64 i = 0; i < t->Array.count; i++) {
+					if (val0_type) {
+						cgValue elem = cg_emit_array_epi(p, val_addr, i);
+						cg_addr_store(p, val0_addr, cg_emit_load(p, elem));
+					}
+					if (val1_type) cg_addr_store(p, val1_addr, cg_const_value(p, val1_type, exact_value_i64(i)));
+
+					cg_build_stmt(p, rs->body);
+				}
+			}
+			break;
+		case Type_EnumeratedArray:
+			if (t->EnumeratedArray.count > 0) {
+				cgValue val = cg_build_expr(p, expr);
+				cgValue val_addr = cg_address_from_load_or_generate_local(p, val);
+
+				for (i64 i = 0; i < t->EnumeratedArray.count; i++) {
+					if (val0_type) {
+						cgValue elem = cg_emit_array_epi(p, val_addr, i);
+						cg_addr_store(p, val0_addr, cg_emit_load(p, elem));
+					}
+					if (val1_type) {
+						ExactValue idx = exact_value_add(exact_value_i64(i), *t->EnumeratedArray.min_value);
+						cg_addr_store(p, val1_addr, cg_const_value(p, val1_type, idx));
+					}
+
+					cg_build_stmt(p, rs->body);
+				}
+			}
+			break;
+		default:
+			GB_PANIC("Invalid '#unroll for' type");
+			break;
+		}
+	}
+}
+
+
 gb_internal void cg_build_stmt(cgProcedure *p, Ast *node) {
 	Ast *prev_stmt = p->curr_stmt;
 	defer (p->curr_stmt = prev_stmt);
@@ -3040,8 +3469,7 @@ gb_internal void cg_build_stmt(cgProcedure *p, Ast *node) {
 	case_end;
 
 	case_ast_node(rs, UnrollRangeStmt, node);
-		GB_PANIC("TODO(bill): lb_build_unroll_range_stmt");
-		// cg_build_range_stmt(p, rs, rs->scope);
+		cg_build_unroll_range_stmt(p, rs, rs->scope);
 	case_end;
 
 	case_ast_node(fs, SwitchStmt, node);

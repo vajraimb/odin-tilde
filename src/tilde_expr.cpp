@@ -123,10 +123,20 @@ gb_internal cgAddr cg_build_addr_from_entity(cgProcedure *p, Entity *e, Ast *exp
 	GB_ASSERT(e != nullptr);
 	if (e->kind == Entity_Constant) {
 		Type *t = default_type(type_of_expr(expr));
-		cgValue v = cg_const_value(p, t, e->Constant.value);
-		GB_PANIC("TODO(bill): cg_add_global_generated");
-		// return cg_add_global_generated(p->module, t, v);
-		return {};
+		// NOTE(odin-tilde): address of a constant — materialize the
+		// ExactValue into a generated global (mirrors
+		// lb_add_global_generated_from_procedure; the value is written
+		// directly from the ExactValue since scalar TB nodes cannot be
+		// global initializers).
+		cgModule *m = p->module;
+		char name[32] = {};
+		gb_snprintf(name, 31, "ggv$%u", 1+m->const_nil_guid.fetch_add(1));
+		TB_Global *g = tb_global_create(m->mod, -1, name, cg_debug_type(m, t), TB_LINKAGE_PRIVATE);
+		i64 max_objects = cg_global_const_calculate_region_count(e->Constant.value, t);
+		tb_global_set_storage(m->mod, tb_module_get_data(m->mod), g, type_size_of(t), type_align_of(t), max_objects);
+		cg_global_const_add_region(m, e->Constant.value, t, g, 0);
+		TB_Node *node = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)g);
+		return cg_addr(cg_value(node, alloc_type_pointer(t)));
 	}
 
 	cgAddr *local_found = map_get(&p->variable_map, e);
@@ -365,6 +375,310 @@ gb_internal cgValue cg_emit_byte_swap(cgProcedure *p, cgValue value, Type *end_t
 	return cg_emit_transmute(p, value, end_type);
 }
 
+// NOTE(odin-tilde): TB has no 128-bit integer type, so u128/i128 (and their
+// endian variants) are opaque 16-byte aggregates (cg_data_type returns VOID).
+// Everything below lowers operations on them to pairs of u64 limbs in memory.
+// Division/modulus go through the runtime's soft implementations (udivti3 &
+// co in base/runtime/internal_i128.odin), which are themselves compiled by
+// this backend on top of these primitives.
+
+gb_internal bool cg_is_type_integer_128(Type *t) {
+	t = core_type(t);
+	return is_type_integer(t) && type_size_of(t) == 16;
+}
+
+gb_internal bool cg_u128_is_swapped(Type *t) {
+	// big-endian variants on a little-endian target store the value
+	// byte-swapped: the low limb lives at offset 8, both limbs bswap'd
+	return is_type_different_to_arch_endianness(t);
+}
+
+gb_internal TB_Node *cg_emit_u128_limb_load(cgProcedure *p, TB_Node *base_ptr, bool swapped, int limb) {
+	GB_ASSERT(limb == 0 || limb == 1);
+	i64 off = 8 * (swapped ? (1 - limb) : limb);
+	TB_Node *ptr = base_ptr;
+	if (off != 0) {
+		ptr = tb_inst_member_access(p->func, base_ptr, off);
+	}
+	TB_Node *n = tb_inst_load(p->func, TB_TYPE_I64, ptr, 8, false);
+	if (swapped) {
+		n = tb_inst_bswap(p->func, n);
+	}
+	return n;
+}
+
+gb_internal void cg_emit_u128_limb_store(cgProcedure *p, TB_Node *base_ptr, bool swapped, int limb, TB_Node *n) {
+	GB_ASSERT(limb == 0 || limb == 1);
+	i64 off = 8 * (swapped ? (1 - limb) : limb);
+	TB_Node *ptr = base_ptr;
+	if (off != 0) {
+		ptr = tb_inst_member_access(p->func, base_ptr, off);
+	}
+	if (swapped) {
+		n = tb_inst_bswap(p->func, n);
+	}
+	tb_inst_store(p->func, TB_TYPE_I64, ptr, n, 8, false);
+}
+
+gb_internal TB_Node *cg_u128_addr_of(cgProcedure *p, cgValue v) {
+	cgValue a = cg_address_from_load_or_generate_local(p, v);
+	GB_ASSERT(a.node->dt.type == TB_TAG_PTR);
+	return a.node;
+}
+
+gb_internal cgValue cg_u128_make_value(cgProcedure *p, Type *type, bool swapped, TB_Node *lo, TB_Node *hi) {
+	cgAddr res = cg_add_local(p, type, nullptr, false);
+	cg_emit_u128_limb_store(p, res.addr.node, swapped, 0, lo);
+	cg_emit_u128_limb_store(p, res.addr.node, swapped, 1, hi);
+	return cg_addr_load(p, res);
+}
+
+gb_internal cgValue cg_emit_arith_u128(cgProcedure *p, TokenKind op, cgValue lhs, cgValue rhs, Type *type) {
+	lhs = cg_emit_conv(p, lhs, type);
+	rhs = cg_emit_conv(p, rhs, type);
+
+	TB_Function *f = p->func;
+	bool swapped = cg_u128_is_swapped(type);
+	bool is_signed = !is_type_unsigned(type);
+	TB_ArithmeticBehavior ab = cast(TB_ArithmeticBehavior)0;
+
+	if (op == Token_Quo || op == Token_Mod || op == Token_ModMod) {
+		// soft division through the runtime (udivmod128 lowers to u64 limbs)
+		Type *rt = is_signed ? t_i128 : t_u128;
+		char const *name = nullptr;
+		if (is_signed) {
+			name = (op == Token_Quo) ? "divti3" : "modti3";
+		} else {
+			name = (op == Token_Quo) ? "udivti3" : "umodti3";
+		}
+		auto args = slice_make<cgValue>(permanent_allocator(), 2);
+		args[0] = cg_emit_conv(p, lhs, rt);
+		args[1] = cg_emit_conv(p, rhs, rt);
+		cgValue res = cg_emit_runtime_call(p, name, args);
+		res = cg_emit_conv(p, res, type);
+		if (op == Token_ModMod && is_signed) {
+			// ((x %% y) + y) %% y
+			res = cg_emit_arith_u128(p, Token_Add, res, rhs, type);
+			res = cg_emit_arith_u128(p, Token_Mod, res, rhs, type);
+		}
+		return res;
+	}
+
+	TB_Node *lp = cg_u128_addr_of(p, lhs);
+	TB_Node *rp = cg_u128_addr_of(p, rhs);
+	TB_Node *a0 = cg_emit_u128_limb_load(p, lp, swapped, 0);
+	TB_Node *a1 = cg_emit_u128_limb_load(p, lp, swapped, 1);
+	TB_Node *b0 = cg_emit_u128_limb_load(p, rp, swapped, 0);
+	TB_Node *b1 = cg_emit_u128_limb_load(p, rp, swapped, 1);
+
+	TB_Node *r0 = nullptr;
+	TB_Node *r1 = nullptr;
+
+	switch (op) {
+	case Token_Add: {
+		r0 = tb_inst_add(f, a0, b0, ab);
+		TB_Node *carry = tb_inst_cmp_ilt(f, r0, a0, false);
+		carry = tb_inst_zxt(f, carry, TB_TYPE_I64);
+		r1 = tb_inst_add(f, tb_inst_add(f, a1, b1, ab), carry, ab);
+		break;
+	}
+	case Token_Sub: {
+		TB_Node *borrow = tb_inst_cmp_ilt(f, a0, b0, false);
+		borrow = tb_inst_zxt(f, borrow, TB_TYPE_I64);
+		r0 = tb_inst_sub(f, a0, b0, ab);
+		r1 = tb_inst_sub(f, tb_inst_sub(f, a1, b1, ab), borrow, ab);
+		break;
+	}
+	case Token_Mul: {
+		// low 128 bits of the product: a0*b0 in full, plus the low words
+		// of the cross terms
+		GB_ASSERT(cg_tb_builder != nullptr);
+		TB_Node *hi0 = nullptr;
+		TB_Node *lo0 = tb_builder_umulpair(cg_tb_g(f), a0, b0, &hi0);
+		TB_Node *c1 = tb_inst_mul(f, a0, b1, ab);
+		TB_Node *c2 = tb_inst_mul(f, a1, b0, ab);
+		r0 = lo0;
+		r1 = tb_inst_add(f, tb_inst_add(f, hi0, c1, ab), c2, ab);
+		break;
+	}
+	case Token_And:
+		r0 = tb_inst_and(f, a0, b0);
+		r1 = tb_inst_and(f, a1, b1);
+		break;
+	case Token_Or:
+		r0 = tb_inst_or(f, a0, b0);
+		r1 = tb_inst_or(f, a1, b1);
+		break;
+	case Token_Xor:
+		r0 = tb_inst_xor(f, a0, b0);
+		r1 = tb_inst_xor(f, a1, b1);
+		break;
+	case Token_AndNot:
+		r0 = tb_inst_and(f, a0, tb_inst_not(f, b0));
+		r1 = tb_inst_and(f, a1, tb_inst_not(f, b1));
+		break;
+
+	case Token_Shl:
+	case Token_Shr: {
+		cgValue bits_v = cg_flatten_value(p, cg_emit_conv(p, rhs, t_u64));
+		TB_Node *bits = bits_v.node;
+		TB_Node *zero  = tb_inst_uint(f, TB_TYPE_I64, 0);
+		TB_Node *is0   = tb_inst_cmp_eq(f, bits, zero);
+		TB_Node *lt64  = tb_inst_cmp_ilt(f, bits, tb_inst_uint(f, TB_TYPE_I64, 64), false);
+		TB_Node *ge128 = tb_inst_cmp_ige(f, bits, tb_inst_uint(f, TB_TYPE_I64, 128), false);
+		TB_Node *bits_m64 = tb_inst_sub(f, bits, tb_inst_uint(f, TB_TYPE_I64, 64), ab);
+		TB_Node *inv      = tb_inst_sub(f, tb_inst_uint(f, TB_TYPE_I64, 64), bits, ab);
+
+		bool shr = (op == Token_Shr);
+		bool arith = shr && is_signed;
+		TB_Node *sign = arith ? tb_inst_sar(f, a1, tb_inst_uint(f, TB_TYPE_I64, 63)) : zero;
+
+		// path A: 0 < bits < 64
+		TB_Node *hiA, *loA;
+		if (!shr) {
+			hiA = tb_inst_or(f, tb_inst_shl(f, a1, bits, ab), tb_inst_shr(f, a0, inv));
+			loA = tb_inst_shl(f, a0, bits, ab);
+		} else {
+			loA = tb_inst_or(f, tb_inst_shr(f, a0, bits), tb_inst_shl(f, a1, inv, ab));
+			hiA = arith ? tb_inst_sar(f, a1, bits) : tb_inst_shr(f, a1, bits);
+		}
+		// path B: 64 <= bits < 128
+		TB_Node *hiB, *loB;
+		if (!shr) {
+			hiB = tb_inst_shl(f, a0, bits_m64, ab);
+			loB = zero;
+		} else {
+			loB = arith ? tb_inst_sar(f, a1, bits_m64) : tb_inst_shr(f, a1, bits_m64);
+			hiB = sign;
+		}
+
+		TB_Node *hi = tb_inst_select(f, lt64, tb_inst_select(f, is0, a1, hiA), hiB);
+		TB_Node *lo = tb_inst_select(f, lt64, tb_inst_select(f, is0, a0, loA), loB);
+		TB_Node *of_hi = arith ? sign : zero;
+		TB_Node *of_lo = arith ? sign : zero;
+		r1 = tb_inst_select(f, ge128, of_hi, hi);
+		r0 = tb_inst_select(f, ge128, of_lo, lo);
+		break;
+	}
+
+	default:
+		GB_PANIC("cg_emit_arith_u128: unhandled op %s", token_strings[op].text);
+	}
+
+	GB_ASSERT(r0 != nullptr && r1 != nullptr);
+	return cg_u128_make_value(p, type, swapped, r0, r1);
+}
+
+gb_internal cgValue cg_emit_comp_u128(cgProcedure *p, TokenKind op_kind, cgValue left, cgValue right) {
+	right = cg_emit_conv(p, right, left.type);
+	left  = cg_emit_conv(p, left, right.type);
+
+	Type *type = left.type;
+	TB_Function *f = p->func;
+	bool swapped = cg_u128_is_swapped(type);
+	bool is_signed = !is_type_unsigned(type);
+
+	TB_Node *lp = cg_u128_addr_of(p, left);
+	TB_Node *rp = cg_u128_addr_of(p, right);
+	TB_Node *a0 = cg_emit_u128_limb_load(p, lp, swapped, 0);
+	TB_Node *a1 = cg_emit_u128_limb_load(p, lp, swapped, 1);
+	TB_Node *b0 = cg_emit_u128_limb_load(p, rp, swapped, 0);
+	TB_Node *b1 = cg_emit_u128_limb_load(p, rp, swapped, 1);
+
+	TB_Node *lo_eq = tb_inst_cmp_eq(f, a0, b0);
+	TB_Node *hi_eq = tb_inst_cmp_eq(f, a1, b1);
+	TB_Node *eq = tb_inst_and(f, lo_eq, hi_eq);
+
+	TB_Node *res = nullptr;
+	switch (op_kind) {
+	case Token_CmpEq:
+		res = eq;
+		break;
+	case Token_NotEq:
+		res = tb_inst_or(f, tb_inst_cmp_ne(f, a0, b0), tb_inst_cmp_ne(f, a1, b1));
+		break;
+	default: {
+		TB_Node *hi_lt = tb_inst_cmp_ilt(f, a1, b1, is_signed);
+		TB_Node *lo_lt = tb_inst_cmp_ilt(f, a0, b0, false);
+		TB_Node *lt = tb_inst_or(f, hi_lt, tb_inst_and(f, hi_eq, lo_lt));
+
+		TB_Node *hi_gt = tb_inst_cmp_igt(f, a1, b1, is_signed);
+		TB_Node *lo_gt = tb_inst_cmp_igt(f, a0, b0, false);
+		TB_Node *gt = tb_inst_or(f, hi_gt, tb_inst_and(f, hi_eq, lo_gt));
+
+		switch (op_kind) {
+		case Token_Lt:   res = lt;                         break;
+		case Token_Gt:   res = gt;                         break;
+		case Token_LtEq: res = tb_inst_or(f, lt, eq);      break;
+		case Token_GtEq: res = tb_inst_or(f, gt, eq);      break;
+		}
+		break;
+	}
+	}
+	GB_ASSERT(res != nullptr);
+	return cg_value(res, t_bool);
+}
+
+gb_internal cgValue cg_emit_conv_int128(cgProcedure *p, cgValue value, Type *src, Type *dst, Type *t) {
+	TB_Function *f = p->func;
+	i64 sz = type_size_of(default_type(src));
+	i64 dz = type_size_of(default_type(dst));
+	GB_ASSERT(sz == 16 || dz == 16);
+
+	if (sz == 16 && dz == 16) {
+		if (types_have_same_internal_endian(src, dst)) {
+			value.type = t;
+			return value;
+		}
+		// endianness change: load both limbs (undoing the source swap) and
+		// store them with the destination swap
+		bool s_swap = cg_u128_is_swapped(src);
+		bool d_swap = cg_u128_is_swapped(dst);
+		TB_Node *ap = cg_u128_addr_of(p, value);
+		TB_Node *lo = cg_emit_u128_limb_load(p, ap, s_swap, 0);
+		TB_Node *hi = cg_emit_u128_limb_load(p, ap, s_swap, 1);
+		return cg_u128_make_value(p, t, d_swap, lo, hi);
+	}
+
+	if (dz == 16) {
+		// small integer -> 128-bit: widen to 64 bits with the source
+		// signedness, then store {value, sign_extension}
+		if (is_type_different_to_arch_endianness(src)) {
+			Type *platform_src = integer_endian_type_to_platform_type(src);
+			value = cg_emit_byte_swap(p, value, platform_src);
+		}
+		value = cg_flatten_value(p, value);
+		GB_ASSERT(value.kind == cgValue_Value);
+		TB_Node *v = value.node;
+		bool src_unsigned = is_type_unsigned(src) || is_type_boolean(src);
+		if (v->dt.type == TB_TAG_BOOL) {
+			v = tb_inst_zxt(f, v, TB_TYPE_I64);
+		} else if (v->dt.raw != TB_TYPE_I64.raw) {
+			v = src_unsigned ? tb_inst_zxt(f, v, TB_TYPE_I64) : tb_inst_sxt(f, v, TB_TYPE_I64);
+		}
+		TB_Node *hi = nullptr;
+		if (src_unsigned) {
+			hi = tb_inst_uint(f, TB_TYPE_I64, 0);
+		} else {
+			hi = tb_inst_sar(f, v, tb_inst_uint(f, TB_TYPE_I64, 63));
+		}
+		bool d_swap = cg_u128_is_swapped(dst);
+		return cg_u128_make_value(p, t, d_swap, v, hi);
+	}
+
+	// 128-bit -> small integer: keep the low limb, then narrow
+	bool s_swap = cg_u128_is_swapped(src);
+	TB_Node *ap = cg_u128_addr_of(p, value);
+	TB_Node *lo = cg_emit_u128_limb_load(p, ap, s_swap, 0);
+	cgValue lo_v = cg_value(lo, t_u64);
+	if (dz > 1 && is_type_different_to_arch_endianness(dst)) {
+		Type *platform_dst = integer_endian_type_to_platform_type(dst);
+		cgValue r = cg_emit_conv(p, lo_v, platform_dst);
+		return cg_emit_byte_swap(p, r, t);
+	}
+	return cg_emit_conv(p, lo_v, t);
+}
+
 gb_internal cgValue cg_emit_comp_records(cgProcedure *p, TokenKind op_kind, cgValue left, cgValue right, Type *type) {
 	GB_ASSERT((is_type_struct(type) || is_type_union(type)) && is_type_comparable(type));
 	cgValue left_ptr  = cg_address_from_load_or_generate_local(p, left);
@@ -453,6 +767,11 @@ gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left
 	left  = cg_flatten_value(p, left);
 	right = cg_flatten_value(p, right);
 
+	if (cg_is_type_integer_128(a)) {
+		// NOTE(odin-tilde): 128-bit integers are memory aggregates here
+		return cg_emit_comp_u128(p, op_kind, left, right);
+	}
+
 
 	if (is_type_matrix(a) && (op_kind == Token_CmpEq || op_kind == Token_NotEq)) {
 		GB_PANIC("TODO(bill): cg_emit_comp matrix");
@@ -471,7 +790,42 @@ gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left
 		// return lb_emit_conv(p, res, t_bool);
 	}
 	if (is_type_array_like(a)) {
-		GB_PANIC("TODO(bill): cg_emit_comp is_type_array_like");
+		// NOTE(odin-tilde): mirror of the LLVM strategy — memcmp for
+		// simple-compare arrays, otherwise an inline element-wise gather.
+		Type *tl = base_type(a);
+		GB_ASSERT(op_kind == Token_CmpEq || op_kind == Token_NotEq);
+
+		cgValue lhs = cg_address_from_load_or_generate_local(p, left);
+		cgValue rhs = cg_address_from_load_or_generate_local(p, right);
+
+		if (is_type_simple_compare(tl)) {
+			auto args = slice_make<cgValue>(permanent_allocator(), 3);
+			args[0] = cg_emit_conv(p, lhs, t_rawptr);
+			args[1] = cg_emit_conv(p, rhs, t_rawptr);
+			args[2] = cg_const_int(p, t_int, type_size_of(tl));
+			cgValue val = cg_emit_runtime_call(p, "memory_compare", args);
+			cgValue res = cg_emit_comp(p, op_kind, val, cg_const_int(p, val.type, 0));
+			return cg_emit_conv(p, res, t_bool);
+		}
+
+		i32 count = 0;
+		switch (tl->kind) {
+		case Type_Array:           count = cast(i32)tl->Array.count;           break;
+		case Type_EnumeratedArray: count = cast(i32)tl->EnumeratedArray.count; break;
+		}
+		GB_ASSERT(count >= 0);
+
+		cgValue res = cg_const_bool(p, t_bool, op_kind == Token_CmpEq);
+		TokenKind cmp_op = (op_kind == Token_CmpEq) ? Token_And : Token_Or;
+		for (i32 i = 0; i < count; i++) {
+			cgValue x = cg_emit_load(p, cg_emit_array_epi(p, lhs, i));
+			cgValue y = cg_emit_load(p, cg_emit_array_epi(p, rhs, i));
+			cgValue cmp = cg_emit_comp(p, op_kind, x, y);
+			cmp = cg_emit_conv(p, cmp, t_bool);
+			res = cg_emit_arith(p, cmp_op, res, cmp, t_bool);
+		}
+		return res;
+	}
 		// Type *tl = base_type(a);
 		// lbValue lhs = lb_address_from_load_or_generate_local(p, left);
 		// lbValue rhs = lb_address_from_load_or_generate_local(p, right);
@@ -534,7 +888,6 @@ gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left
 		// 		return lb_addr_load(p, val);
 		// 	}
 		// }
-	}
 
 	if ((is_type_struct(a) || is_type_union(a)) && is_type_comparable(a)) {
 		return cg_emit_comp_records(p, op_kind, left, right, a);
@@ -592,11 +945,10 @@ gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left
 		}
 		GB_ASSERT(runtime_procedure != nullptr);
 
-		GB_PANIC("TODO(bill): cg_emit_runtime_call");
-		// auto args = array_make<lbValue>(permanent_allocator(), 2);
-		// args[0] = left;
-		// args[1] = right;
-		// return lb_emit_runtime_call(p, runtime_procedure, args);
+		auto args = slice_make<cgValue>(permanent_allocator(), 2);
+		args[0] = left;
+		args[1] = right;
+		return cg_emit_runtime_call(p, runtime_procedure, args);
 	}
 
 	if (is_type_quaternion(a)) {
@@ -624,11 +976,10 @@ gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left
 		}
 		GB_ASSERT(runtime_procedure != nullptr);
 
-		GB_PANIC("TODO(bill): cg_emit_runtime_call");
-		// auto args = array_make<lbValue>(permanent_allocator(), 2);
-		// args[0] = left;
-		// args[1] = right;
-		// return lb_emit_runtime_call(p, runtime_procedure, args);
+		auto args = slice_make<cgValue>(permanent_allocator(), 2);
+		args[0] = left;
+		args[1] = right;
+		return cg_emit_runtime_call(p, runtime_procedure, args);
 	}
 
 	if (is_type_bit_set(a)) {
@@ -1059,6 +1410,22 @@ gb_internal TB_Node *cg_tb_f32_to_f16_node(TB_Function *f, TB_Node *f32) {
 gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 	t = reduce_tuple_to_single_type(t);
 
+	if (value.kind == cgValue_Multi && t != nullptr && is_type_tuple(base_type(t))) {
+		// NOTE(odin-tilde): a multi-value result converted to a tuple type
+		// (e.g. `a, b := f() or_break`, where the try lhs is every value
+		// but the trailing condition); tuples are not first-class values
+		// in this backend, so materialize them into a local.
+		Type *bt = base_type(t);
+		GB_ASSERT(value.multi->values.count == bt->Tuple.variables.count);
+		cgAddr dst = cg_add_local(p, t, nullptr, false);
+		cgValue ptr = cg_addr_get_ptr(p, dst);
+		for_array(i, value.multi->values) {
+			cgValue v = cg_emit_conv(p, value.multi->values[i], bt->Tuple.variables[i]->type);
+			cg_emit_store(p, cg_emit_struct_ep(p, ptr, cast(i32)i), v);
+		}
+		return cg_addr_load(p, dst);
+	}
+
 	value = cg_flatten_value(p, value);
 
 	Type *src_type = value.type;
@@ -1092,10 +1459,16 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 	if (is_type_integer(src) && is_type_integer(dst)) {
 		GB_ASSERT(src->kind == Type_Basic &&
 		          dst->kind == Type_Basic);
-		GB_ASSERT(value.kind == cgValue_Value);
 
 		i64 sz = type_size_of(default_type(src));
 		i64 dz = type_size_of(default_type(dst));
+
+		if (sz == 16 || dz == 16) {
+			// NOTE(odin-tilde): 128-bit integers are memory aggregates here
+			return cg_emit_conv_int128(p, value, src, dst, t);
+		}
+
+		GB_ASSERT(value.kind == cgValue_Value);
 
 		if (sz == dz) {
 			if (dz > 1 && !types_have_same_internal_endian(src, dst)) {
@@ -1132,12 +1505,27 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 
 	// boolean -> boolean/integer
 	if (is_type_boolean(src) && (is_type_boolean(dst) || is_type_integer(dst))) {
+		if (type_size_of(dst) == 16) {
+			// NOTE(odin-tilde): widen through u64 into the aggregate
+			cgValue v64 = cg_emit_conv(p, value, t_u64);
+			return cg_emit_conv_int128(p, v64, t_u64, dst, t);
+		}
 		TB_Node *v = tb_inst_cmp_ne(p->func, value.node, tb_inst_uint(p->func, st, 0));
 		return cg_value(tb_inst_zxt(p->func, v, dt), t);
 	}
 
 	// integer -> boolean
 	if (is_type_integer(src) && is_type_boolean(dst)) {
+		if (type_size_of(src) == 16) {
+			// NOTE(odin-tilde): x != 0 across both limbs
+			bool s_swap = cg_u128_is_swapped(src);
+			TB_Node *ap = cg_u128_addr_of(p, value);
+			TB_Node *lo = cg_emit_u128_limb_load(p, ap, s_swap, 0);
+			TB_Node *hi = cg_emit_u128_limb_load(p, ap, s_swap, 1);
+			TB_Node *any = tb_inst_or(p->func, lo, hi);
+			TB_Node *v = tb_inst_cmp_ne(p->func, any, tb_inst_uint(p->func, TB_TYPE_I64, 0));
+			return cg_value(tb_inst_zxt(p->func, v, dt), t);
+		}
 		TB_Node *v = tb_inst_cmp_ne(p->func, value.node, tb_inst_uint(p->func, st, 0));
 		return cg_value(tb_inst_zxt(p->func, v, dt), t);
 	}
@@ -1264,7 +1652,10 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 		if (dz >= sz) {
 			return cg_value(tb_inst_fpxt(p->func, value.node, dt), t);
 		}
-		return cg_value(tb_inst_trunc(p->func, value.node, dt), t);
+		// PATCH(odin-tilde): float narrowing must be a real value conversion
+		// (cvtsd2ss), not an integer-style bit truncation — tb_inst_trunc on an
+		// F64 keeps the low 32 bits, which is 0 for values like 1.5.
+		return cg_value(tb_inst_fptrunc(p->func, value.node, dt), t);
 	}
 
 	if (is_type_complex(src) && is_type_complex(dst)) {
@@ -1534,7 +1925,46 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 	// NOTE(bill): This has to be done before 'Pointer <-> Pointer' as it's
 	// subtype polymorphism casting
 	if (check_is_assignable_to_using_subtype(src_type, t)) {
-		GB_PANIC("TODO(bill): ? -> subtyping");
+		Type *st = type_deref(src_type);
+		st = type_deref(st);
+
+		bool st_is_ptr = is_type_pointer(src_type);
+		st = base_type(st);
+
+		Type *dt = t;
+
+		TEMPORARY_ALLOCATOR_GUARD();
+
+		GB_ASSERT(is_type_struct(st) || is_type_raw_union(st));
+		Selection sel = {};
+		sel.index.allocator = temporary_allocator();
+		if (lookup_subtype_polymorphic_selection(t, src_type, &sel)) {
+			if (sel.entity == nullptr) {
+				GB_PANIC("invalid subtype cast  %s -> %s", type_to_string(src_type), type_to_string(t));
+			}
+			if (st_is_ptr) {
+				cgValue res = cg_emit_deep_field_gep(p, value, sel);
+				Type *rt = res.type;
+				if (!are_types_identical(rt, dt) && are_types_identical(type_deref(rt), dt)) {
+					res = cg_emit_load(p, res);
+				}
+				return res;
+			} else {
+				if (is_type_pointer(value.type)) {
+					Type *rt = value.type;
+					if (!are_types_identical(rt, dt) && are_types_identical(type_deref(rt), dt)) {
+						value = cg_emit_load(p, value);
+					} else {
+						value = cg_emit_deep_field_gep(p, value, sel);
+						return cg_emit_load(p, value);
+					}
+				}
+
+				cgValue ptr = cg_address_from_load_or_generate_local(p, value);
+				cgValue res = cg_emit_deep_field_gep(p, ptr, sel);
+				return cg_emit_load(p, res);
+			}
+		}
 	}
 
 	// Pointer <-> Pointer
@@ -1582,11 +2012,104 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 	}
 
 	if (is_type_matrix(dst) && !is_type_matrix(src)) {
-		GB_PANIC("TODO(bill): !matrix -> matrix");
+		// NOTE(odin-tilde): mirrors lb — a scalar converts to a square
+		// matrix as a scaled identity matrix.
+		GB_ASSERT_MSG(dst->Matrix.row_count == dst->Matrix.column_count, "%s <- %s", type_to_string(dst), type_to_string(src));
+
+		Type *elem = base_array_type(dst);
+		cgValue e = cg_emit_conv(p, value, elem);
+		cgAddr v = cg_add_local(p, t, nullptr, false);
+		// matrix elems may be int, float or complex — build the zero
+		// constant with the matching ExactValue kind.
+		cgValue zero = {};
+		if (is_type_float(elem)) {
+			zero = cg_const_value(p, elem, exact_value_float(0));
+		} else if (is_type_complex(elem)) {
+			ExactValue cz = {};
+			cz.kind = ExactValue_Complex;
+			zero = cg_const_value(p, elem, cz);
+		} else {
+			zero = cg_const_value(p, elem, exact_value_i64(0));
+		}
+		for (i64 j = 0; j < dst->Matrix.column_count; j++) {
+			for (i64 i = 0; i < dst->Matrix.row_count; i++) {
+				cgValue ptr = cg_emit_matrix_epi(p, v.addr, i, j);
+				cg_emit_store(p, ptr, i == j ? e : zero);
+			}
+		}
+
+		return cg_addr_load(p, v);
 	}
 
 	if (is_type_matrix(dst) && is_type_matrix(src)) {
-		GB_PANIC("TODO(bill): matrix -> matrix");
+		// NOTE(odin-tilde): mirrors lb's matrix->matrix conversion.
+		GB_ASSERT(dst->kind == Type_Matrix);
+		GB_ASSERT(src->kind == Type_Matrix);
+		cgAddr v = cg_add_local(p, t, nullptr, true);
+		cgValue psrc = cg_address_from_load_or_generate_local(p, value);
+
+		if (dst->Matrix.row_count    == src->Matrix.row_count &&
+		    dst->Matrix.column_count == src->Matrix.column_count) {
+			for (i64 j = 0; j < dst->Matrix.column_count; j++) {
+				for (i64 i = 0; i < dst->Matrix.row_count; i++) {
+					cgValue d = cg_emit_matrix_epi(p, v.addr, i, j);
+					cgValue s = cg_emit_load(p, cg_emit_matrix_epi(p, psrc, i, j));
+					s = cg_emit_conv(p, s, dst->Matrix.elem);
+					cg_emit_store(p, d, s);
+				}
+			}
+		} else if (is_matrix_square(dst) && is_matrix_square(src)) {
+			for (i64 j = 0; j < dst->Matrix.column_count; j++) {
+				for (i64 i = 0; i < dst->Matrix.row_count; i++) {
+					if (i < src->Matrix.row_count && j < src->Matrix.column_count) {
+						cgValue d = cg_emit_matrix_epi(p, v.addr, i, j);
+						cgValue s = cg_emit_load(p, cg_emit_matrix_epi(p, psrc, i, j));
+						s = cg_emit_conv(p, s, dst->Matrix.elem);
+						cg_emit_store(p, d, s);
+					} else if (i == j) {
+						cgValue d = cg_emit_matrix_epi(p, v.addr, i, j);
+						cgValue one = {};
+						if (is_type_float(dst->Matrix.elem)) {
+							one = cg_const_value(p, dst->Matrix.elem, exact_value_float(1));
+						} else if (is_type_complex(dst->Matrix.elem)) {
+							ExactValue co = {};
+							co.kind = ExactValue_Complex;
+							co.value_complex = permanent_alloc_item<Complex128>();
+							co.value_complex->real = 1;
+							one = cg_const_value(p, dst->Matrix.elem, co);
+						} else {
+							one = cg_const_value(p, dst->Matrix.elem, exact_value_i64(1));
+						}
+						cg_emit_store(p, d, one);
+					}
+				}
+			}
+		} else {
+			i64 dst_count = dst->Matrix.row_count*dst->Matrix.column_count;
+			i64 src_count = src->Matrix.row_count*src->Matrix.column_count;
+			GB_ASSERT(dst_count == src_count);
+
+			bool same_elem_base_types = are_types_identical(
+				base_type(dst->Matrix.elem),
+				base_type(src->Matrix.elem)
+			);
+
+			if (same_elem_base_types && type_size_of(dst) == type_size_of(src)) {
+				i64 size = type_size_of(dst);
+				tb_inst_memcpy(p->func, v.addr.node, psrc.node,
+				               tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)size),
+				               cast(TB_CharUnits)type_align_of(dst));
+			} else {
+				for (i64 i = 0; i < src_count; i++) {
+					cgValue dp = cg_emit_array_epi(p, v.addr, matrix_column_major_index_to_offset(dst, i));
+					cgValue sp = cg_emit_array_epi(p, psrc,   matrix_column_major_index_to_offset(src, i));
+					cgValue s = cg_emit_load(p, sp);
+					s = cg_emit_conv(p, s, dst->Matrix.elem);
+					cg_emit_store(p, dp, s);
+				}
+			}
+		}
+		return cg_addr_load(p, v);
 	}
 
 	if (is_type_any(dst)) {
@@ -1655,7 +2178,6 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 	gb_printf_err("Not Identical %p != %p\n", src_type, t);
 	gb_printf_err("Not Identical %p != %p\n", src, dst);
 
-
 	GB_PANIC("Invalid type conversion: '%s' to '%s' for procedure '%.*s'",
 	         type_to_string(src_type), type_to_string(t),
 	         LIT(p->name));
@@ -1665,13 +2187,163 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 
 gb_internal cgValue cg_emit_arith(cgProcedure *p, TokenKind op, cgValue lhs, cgValue rhs, Type *type) {
 	if (is_type_array_like(lhs.type) || is_type_array_like(rhs.type)) {
-		GB_PANIC("TODO(bill): cg_emit_arith_array");
+		// NOTE(odin-tilde): element-wise array arithmetic. A scalar operand
+		// broadcasts across the elements (LLVM splats it into the array via
+		// conv; here the scalar is simply reused for every element).
+		GB_ASSERT(is_type_array_like(type));
+		Type *elem_type = base_array_type(type);
+		i64 count = get_array_type_count(type);
+
+		cgValue x = lhs, y = rhs;
+		cgValue x_ptr = {}, y_ptr = {};
+		if (is_type_array_like(x.type)) {
+			x = cg_emit_conv(p, x, type);
+			x_ptr = cg_address_from_load_or_generate_local(p, x);
+		} else {
+			x = cg_flatten_value(p, cg_emit_conv(p, x, elem_type));
+		}
+		if (is_type_array_like(y.type)) {
+			y = cg_emit_conv(p, y, type);
+			y_ptr = cg_address_from_load_or_generate_local(p, y);
+		} else {
+			y = cg_flatten_value(p, cg_emit_conv(p, y, elem_type));
+		}
+
+		cgAddr res = cg_add_local(p, type, nullptr, false);
+		cgValue dst_ptr = cg_addr_get_ptr(p, res);
+		for (i64 i = 0; i < count; i++) {
+			cgValue a = x_ptr.node ? cg_emit_load(p, cg_emit_array_epi(p, x_ptr, i)) : x;
+			cgValue b = y_ptr.node ? cg_emit_load(p, cg_emit_array_epi(p, y_ptr, i)) : y;
+			cgValue c = cg_emit_arith(p, op, a, b, elem_type);
+			cg_emit_store(p, cg_emit_array_epi(p, dst_ptr, i), c);
+		}
+		return cg_addr_load(p, res);
 	} else if (is_type_matrix(lhs.type) || is_type_matrix(rhs.type)) {
-		GB_PANIC("TODO(bill): cg_emit_arith_matrix");
+		return cg_emit_arith_matrix(p, op, lhs, rhs, type, false);
 	} else if (is_type_complex(type)) {
-		GB_PANIC("TODO(bill): cg_emit_arith complex");
+		// NOTE(odin-tilde): mirrors lb_emit_arith's complex path. complex is
+		// a 2-field memory aggregate here; division goes through the runtime
+		// (Smith's algorithm), everything else is element-wise. f16 elements
+		// are promoted to f32 for the arithmetic itself since TB has no f16.
+		lhs = cg_emit_conv(p, lhs, type);
+		rhs = cg_emit_conv(p, rhs, type);
+
+		Type *ft = base_complex_elem_type(type);
+
+		if (op == Token_Quo) {
+			auto args = slice_make<cgValue>(permanent_allocator(), 2);
+			args[0] = lhs;
+			args[1] = rhs;
+			switch (type_size_of(ft)) {
+			case 2: return cg_emit_runtime_call(p, "quo_complex32", args);
+			case 4: return cg_emit_runtime_call(p, "quo_complex64", args);
+			case 8: return cg_emit_runtime_call(p, "quo_complex128", args);
+			default: GB_PANIC("Unknown float type"); break;
+			}
+		}
+
+		Type *it = ft;
+		if (type_size_of(ft) == 2) {
+			it = t_f32;
+		}
+
+		cgValue lptr = cg_address_from_load_or_generate_local(p, lhs);
+		cgValue rptr = cg_address_from_load_or_generate_local(p, rhs);
+		cgValue a = cg_emit_load(p, cg_emit_struct_ep(p, lptr, 0));
+		cgValue b = cg_emit_load(p, cg_emit_struct_ep(p, lptr, 1));
+		cgValue c = cg_emit_load(p, cg_emit_struct_ep(p, rptr, 0));
+		cgValue d = cg_emit_load(p, cg_emit_struct_ep(p, rptr, 1));
+		if (it != ft) {
+			a = cg_emit_conv(p, a, it);
+			b = cg_emit_conv(p, b, it);
+			c = cg_emit_conv(p, c, it);
+			d = cg_emit_conv(p, d, it);
+		}
+
+		cgValue real = {};
+		cgValue imag = {};
+		switch (op) {
+		case Token_Add:
+		case Token_Sub:
+			real = cg_emit_arith(p, op, a, c, it);
+			imag = cg_emit_arith(p, op, b, d, it);
+			break;
+		case Token_Mul: {
+			cgValue x = cg_emit_arith(p, Token_Mul, a, c, it);
+			cgValue y = cg_emit_arith(p, Token_Mul, b, d, it);
+			real = cg_emit_arith(p, Token_Sub, x, y, it);
+			cgValue z = cg_emit_arith(p, Token_Mul, b, c, it);
+			cgValue w = cg_emit_arith(p, Token_Mul, a, d, it);
+			imag = cg_emit_arith(p, Token_Add, z, w, it);
+			break;
+		}
+		default:
+			GB_PANIC("cg_emit_arith complex: invalid op");
+			break;
+		}
+		if (it != ft) {
+			real = cg_emit_conv(p, real, ft);
+			imag = cg_emit_conv(p, imag, ft);
+		}
+
+		cgAddr res = cg_add_local(p, type, nullptr, false);
+		cgValue dst = cg_addr_get_ptr(p, res);
+		cg_emit_store(p, cg_emit_struct_ep(p, dst, 0), real);
+		cg_emit_store(p, cg_emit_struct_ep(p, dst, 1), imag);
+		return cg_addr_load(p, res);
 	} else if (is_type_quaternion(type)) {
-		GB_PANIC("TODO(bill): cg_emit_arith quaternion");
+		// NOTE(odin-tilde): mirrors lb_emit_arith's quaternion path.
+		// @QuaternionLayout: i,j,k,w at indices 0,1,2,3. mul/div go through
+		// the runtime; add/sub are element-wise (f16 promoted to f32).
+		lhs = cg_emit_conv(p, lhs, type);
+		rhs = cg_emit_conv(p, rhs, type);
+
+		Type *ft = base_complex_elem_type(type);
+
+		if (op == Token_Mul || op == Token_Quo) {
+			char const *name = nullptr;
+			switch (8*type_size_of(ft)) {
+			case 16: name = (op == Token_Mul) ? "mul_quaternion64"  : "quo_quaternion64";  break;
+			case 32: name = (op == Token_Mul) ? "mul_quaternion128" : "quo_quaternion128"; break;
+			case 64: name = (op == Token_Mul) ? "mul_quaternion256" : "quo_quaternion256"; break;
+			default: GB_PANIC("Unknown float type"); break;
+			}
+			auto args = slice_make<cgValue>(permanent_allocator(), 2);
+			args[0] = lhs;
+			args[1] = rhs;
+			return cg_emit_runtime_call(p, name, args);
+		}
+
+		GB_ASSERT(op == Token_Add || op == Token_Sub);
+
+		Type *it = ft;
+		if (type_size_of(ft) == 2) {
+			it = t_f32;
+		}
+
+		cgValue lptr = cg_address_from_load_or_generate_local(p, lhs);
+		cgValue rptr = cg_address_from_load_or_generate_local(p, rhs);
+		cgAddr res = cg_add_local(p, type, nullptr, false);
+		cgValue dst = cg_addr_get_ptr(p, res);
+		for (isize i = 0; i < 4; i++) {
+			cgValue x = cg_emit_load(p, cg_emit_struct_ep(p, lptr, i));
+			cgValue y = cg_emit_load(p, cg_emit_struct_ep(p, rptr, i));
+			if (it != ft) {
+				x = cg_emit_conv(p, x, it);
+				y = cg_emit_conv(p, y, it);
+			}
+			cgValue z = cg_emit_arith(p, op, x, y, it);
+			if (it != ft) {
+				z = cg_emit_conv(p, z, ft);
+			}
+			cg_emit_store(p, cg_emit_struct_ep(p, dst, i), z);
+		}
+		return cg_addr_load(p, res);
+	}
+
+	if (cg_is_type_integer_128(type)) {
+		// NOTE(odin-tilde): 128-bit integers are memory aggregates here
+		return cg_emit_arith_u128(p, op, lhs, rhs, type);
 	}
 
 	lhs = cg_flatten_value(p, cg_emit_conv(p, lhs, type));
@@ -1953,63 +2625,71 @@ gb_internal cgAddr cg_build_addr_slice_expr(cgProcedure *p, Ast *expr) {
 
 
 	case Type_Struct:
-		// if (is_type_soa_struct(type)) {
-		// 	lbValue len = lb_soa_struct_len(p, lb_addr_get_ptr(p, addr));
-		// 	if (high.value == nullptr) high = len;
+		if (is_type_soa_struct(type)) {
+			// NOTE(odin-tilde): mirrors the lb #soa slicing logic (kept as
+			// a comment above this branch in earlier revisions). Slicing a
+			// #soa value produces a #soa slice struct: each component field
+			// becomes a pointer offset by `low`, plus the new length.
+			Type *res_type = type_of_expr(expr);
+			cgValue base_ptr = cg_address_from_load_or_generate_local(p, base);
 
-		// 	if (!no_indices) {
-		// 		lb_emit_slice_bounds_check(p, se->open, low, high, len, se->low != nullptr);
-		// 	}
-		// 	#if 1
+			cgValue len = {};
+			if (type->Struct.soa_kind == StructSoa_Fixed) {
+				len = cg_const_int(p, t_int, type->Struct.soa_count);
+			} else {
+				len = cg_builtin_len(p, base);
+			}
+			if (high.node == nullptr) high = len;
 
-		// 	lbAddr dst = lb_add_local_generated(p, type_of_expr(expr), true);
-		// 	if (type->Struct.soa_kind == StructSoa_Fixed) {
-		// 		i32 field_count = cast(i32)type->Struct.fields.count;
-		// 		for (i32 i = 0; i < field_count; i++) {
-		// 			lbValue field_dst = lb_emit_struct_ep(p, dst.addr, i);
-		// 			lbValue field_src = lb_emit_struct_ep(p, lb_addr_get_ptr(p, addr), i);
-		// 			field_src = lb_emit_array_ep(p, field_src, low);
-		// 			lb_emit_store(p, field_dst, field_src);
-		// 		}
+			cgAddr dst = cg_add_local(p, res_type, nullptr, false);
+			if (type->Struct.soa_kind == StructSoa_Fixed) {
+				i32 field_count = cast(i32)type->Struct.fields.count;
+				for (i32 i = 0; i < field_count; i++) {
+					cgValue field_dst = cg_emit_struct_ep(p, dst.addr, i);
+					cgValue field_src = cg_emit_struct_ep(p, base_ptr, i);
+					field_src = cg_emit_array_ep(p, field_src, low);
+					// ^elem -> [^]elem (the #soa slice fields are multi-pointers)
+					field_src = cg_emit_conv(p, field_src, type_deref(field_dst.type));
+					cg_emit_store(p, field_dst, field_src);
+				}
 
-		// 		lbValue len_dst = lb_emit_struct_ep(p, dst.addr, field_count);
-		// 		lbValue new_len = lb_emit_arith(p, Token_Sub, high, low, t_int);
-		// 		lb_emit_store(p, len_dst, new_len);
-		// 	} else if (type->Struct.soa_kind == StructSoa_Slice) {
-		// 		if (no_indices) {
-		// 			lb_addr_store(p, dst, base);
-		// 		} else {
-		// 			i32 field_count = cast(i32)type->Struct.fields.count - 1;
-		// 			for (i32 i = 0; i < field_count; i++) {
-		// 				lbValue field_dst = lb_emit_struct_ep(p, dst.addr, i);
-		// 				lbValue field_src = lb_emit_struct_ev(p, base, i);
-		// 				field_src = lb_emit_ptr_offset(p, field_src, low);
-		// 				lb_emit_store(p, field_dst, field_src);
-		// 			}
+				cgValue len_dst = cg_emit_struct_ep(p, dst.addr, field_count);
+				cgValue new_len = cg_emit_arith(p, Token_Sub, high, low, t_int);
+				cg_emit_store(p, len_dst, new_len);
+			} else if (type->Struct.soa_kind == StructSoa_Slice) {
+				if (no_indices) {
+					cg_addr_store(p, dst, base);
+				} else {
+					i32 field_count = cast(i32)type->Struct.fields.count - 1;
+					for (i32 i = 0; i < field_count; i++) {
+						cgValue field_dst = cg_emit_struct_ep(p, dst.addr, i);
+						cgValue field_src = cg_emit_load(p, cg_emit_struct_ep(p, base_ptr, i));
+						field_src = cg_emit_ptr_offset(p, field_src, low);
+						field_src = cg_emit_conv(p, field_src, type_deref(field_dst.type));
+						cg_emit_store(p, field_dst, field_src);
+					}
 
+					cgValue len_dst = cg_emit_struct_ep(p, dst.addr, field_count);
+					cgValue new_len = cg_emit_arith(p, Token_Sub, high, low, t_int);
+					cg_emit_store(p, len_dst, new_len);
+				}
+			} else if (type->Struct.soa_kind == StructSoa_Dynamic) {
+				i32 field_count = cast(i32)type->Struct.fields.count - 3;
+				for (i32 i = 0; i < field_count; i++) {
+					cgValue field_dst = cg_emit_struct_ep(p, dst.addr, i);
+					cgValue field_src = cg_emit_load(p, cg_emit_struct_ep(p, base_ptr, i));
+					field_src = cg_emit_ptr_offset(p, field_src, low);
+					field_src = cg_emit_conv(p, field_src, type_deref(field_dst.type));
+					cg_emit_store(p, field_dst, field_src);
+				}
 
-		// 			lbValue len_dst = lb_emit_struct_ep(p, dst.addr, field_count);
-		// 			lbValue new_len = lb_emit_arith(p, Token_Sub, high, low, t_int);
-		// 			lb_emit_store(p, len_dst, new_len);
-		// 		}
-		// 	} else if (type->Struct.soa_kind == StructSoa_Dynamic) {
-		// 		i32 field_count = cast(i32)type->Struct.fields.count - 3;
-		// 		for (i32 i = 0; i < field_count; i++) {
-		// 			lbValue field_dst = lb_emit_struct_ep(p, dst.addr, i);
-		// 			lbValue field_src = lb_emit_struct_ev(p, base, i);
-		// 			field_src = lb_emit_ptr_offset(p, field_src, low);
-		// 			lb_emit_store(p, field_dst, field_src);
-		// 		}
+				cgValue len_dst = cg_emit_struct_ep(p, dst.addr, field_count);
+				cgValue new_len = cg_emit_arith(p, Token_Sub, high, low, t_int);
+				cg_emit_store(p, len_dst, new_len);
+			}
 
-
-		// 		lbValue len_dst = lb_emit_struct_ep(p, dst.addr, field_count);
-		// 		lbValue new_len = lb_emit_arith(p, Token_Sub, high, low, t_int);
-		// 		lb_emit_store(p, len_dst, new_len);
-		// 	}
-
-		// 	return dst;
-		// 	#endif
-		// }
+			return dst;
+		}
 		GB_PANIC("cg_build_addr_slice_expr Type_Struct");
 		break;
 
@@ -2033,6 +2713,24 @@ gb_internal cgValue cg_emit_unary_arith(cgProcedure *p, TokenKind op, cgValue x,
 	}
 
 	x = cg_flatten_value(p, x);
+
+	if (cg_is_type_integer_128(x.type)) {
+		// NOTE(odin-tilde): 128-bit integers are memory aggregates here
+		if (op == Token_Xor) {
+			bool swapped = cg_u128_is_swapped(x.type);
+			TB_Node *ap = cg_u128_addr_of(p, x);
+			TB_Node *lo = tb_inst_not(p->func, cg_emit_u128_limb_load(p, ap, swapped, 0));
+			TB_Node *hi = tb_inst_not(p->func, cg_emit_u128_limb_load(p, ap, swapped, 1));
+			cgValue res = cg_u128_make_value(p, x.type, swapped, lo, hi);
+			return cg_emit_conv(p, res, type);
+		}
+		if (op == Token_Sub) {
+			cgValue zero = cg_const_nil(p, x.type);
+			cgValue res = cg_emit_arith_u128(p, Token_Sub, zero, x, x.type);
+			return cg_emit_conv(p, res, type);
+		}
+		GB_PANIC("cg_emit_unary_arith: unhandled 128-bit op");
+	}
 
 	if (is_type_array_like(x.type)) {
 		GB_PANIC("TODO(bill): cg_emit_unary_arith is_type_array_like");
@@ -2109,7 +2807,10 @@ gb_internal cgValue cg_emit_unary_arith(cgProcedure *p, TokenKind op, cgValue x,
 		if (x.node->dt.type == TB_TAG_BOOL && zero->dt.type != TB_TAG_BOOL) {
 			x.node = tb_inst_zxt(p->func, x.node, zero->dt);
 		}
-		cgValue cmp = cg_value(tb_inst_cmp_ne(p->func, x.node, zero), x.type);
+		// NOTE(odin-tilde): boolean not is x == 0 (was cmp_ne, which made
+		// `!x` the identity and broke every `!cond` in the runtime, e.g.
+		// safe_add's `!did_overflow` in the temp allocator arena).
+		cgValue cmp = cg_value(tb_inst_cmp_eq(p->func, x.node, zero), x.type);
 		return cg_emit_conv(p, cmp, type);
 	}
 
@@ -2135,32 +2836,26 @@ gb_internal cgValue cg_emit_unary_arith(cgProcedure *p, TokenKind op, cgValue x,
 		if (is_type_integer(x.type)) {
 			res = cg_value(tb_inst_neg(p->func, x.node), x.type);
 		} else if (is_type_float(x.type)) {
-			res = cg_value(tb_inst_neg(p->func, x.node), x.type);
-		} else if (is_type_complex(x.type)) {
-			GB_PANIC("TODO(bill): neg complex");
-			// LLVMValueRef v0 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 0, ""), "");
-			// LLVMValueRef v1 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 1, ""), "");
-
-			// cgAddr addr = cg_add_local_generated(p, x.type, false);
-			// LLVMTypeRef type = llvm_addr_type(p->module, addr.addr);
-			// LLVMBuildStore(p->builder, v0, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 0, ""));
-			// LLVMBuildStore(p->builder, v1, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 1, ""));
-			// return cg_addr_load(p, addr);
-
-		} else if (is_type_quaternion(x.type)) {
-			GB_PANIC("TODO(bill): neg quaternion");
-			// LLVMValueRef v0 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 0, ""), "");
-			// LLVMValueRef v1 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 1, ""), "");
-			// LLVMValueRef v2 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 2, ""), "");
-			// LLVMValueRef v3 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 3, ""), "");
-
-			// cgAddr addr = cg_add_local_generated(p, x.type, false);
-			// LLVMTypeRef type = llvm_addr_type(p->module, addr.addr);
-			// LLVMBuildStore(p->builder, v0, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 0, ""));
-			// LLVMBuildStore(p->builder, v1, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 1, ""));
-			// LLVMBuildStore(p->builder, v2, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 2, ""));
-			// LLVMBuildStore(p->builder, v3, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 3, ""));
-			// return cg_addr_load(p, addr);
+			if (type_size_of(x.type) == 2) {
+				// NOTE(odin-tilde): f16 is an I16 bit pattern; negation is
+				// just flipping the sign bit.
+				TB_Node *sign = tb_inst_uint(p->func, TB_TYPE_I16, 0x8000);
+				res = cg_value(tb_inst_xor(p->func, x.node, sign), x.type);
+			} else {
+				res = cg_value(tb_inst_neg(p->func, x.node), x.type);
+			}
+		} else if (is_type_complex(x.type) || is_type_quaternion(x.type)) {
+			// NOTE(odin-tilde): negate every element through the address.
+			isize n = is_type_complex(x.type) ? 2 : 4;
+			cgValue ptr = cg_address_from_load_or_generate_local(p, x);
+			cgAddr addr = cg_add_local(p, x.type, nullptr, false);
+			cgValue dst = cg_addr_get_ptr(p, addr);
+			for (isize i = 0; i < n; i++) {
+				cgValue ev = cg_emit_load(p, cg_emit_struct_ep(p, ptr, i));
+				ev = cg_emit_unary_arith(p, Token_Sub, ev, ev.type);
+				cg_emit_store(p, cg_emit_struct_ep(p, dst, i), ev);
+			}
+			return cg_addr_load(p, addr);
 		} else if (is_type_simd_vector(x.type)) {
 			GB_PANIC("TODO(bill): neg simd");
 			// Type *elem = base_array_type(x.type);
@@ -2439,6 +3134,174 @@ gb_internal cgValue cg_build_logical_binary_expr(cgProcedure *p, TokenKind op, A
 
 
 
+gb_internal cgValue cg_emit_matrix_mul(cgProcedure *p, cgValue lhs, cgValue rhs, Type *type) {
+	// NOTE(odin-tilde): straightforward triple-loop matmul using logical
+	// (row, column) indexing; cg_emit_matrix_epi handles the memory layout.
+	Type *xt = base_type(lhs.type);
+	Type *yt = base_type(rhs.type);
+	Type *rt = base_type(type);
+
+	GB_ASSERT(is_type_matrix(rt));
+	GB_ASSERT(is_type_matrix(xt));
+	GB_ASSERT(is_type_matrix(yt));
+	GB_ASSERT(xt->Matrix.column_count == yt->Matrix.row_count);
+	GB_ASSERT(are_types_identical(xt->Matrix.elem, yt->Matrix.elem));
+
+	Type *elem = xt->Matrix.elem;
+	i64 R = rt->Matrix.row_count;
+	i64 C = rt->Matrix.column_count;
+	i64 K = xt->Matrix.column_count;
+
+	cgValue la = cg_address_from_load_or_generate_local(p, lhs);
+	cgValue ra = cg_address_from_load_or_generate_local(p, rhs);
+	cgAddr res = cg_add_local(p, type, nullptr, false);
+
+	for (i64 i = 0; i < R; i++) {
+		for (i64 j = 0; j < C; j++) {
+			cgValue acc = {};
+			for (i64 k = 0; k < K; k++) {
+				cgValue a = cg_emit_load(p, cg_emit_matrix_epi(p, la, i, k));
+				cgValue b = cg_emit_load(p, cg_emit_matrix_epi(p, ra, k, j));
+				cgValue prod = cg_emit_arith(p, Token_Mul, a, b, elem);
+				acc = (k == 0) ? prod : cg_emit_arith(p, Token_Add, acc, prod, elem);
+			}
+			cg_emit_store(p, cg_emit_matrix_epi(p, res.addr, i, j), acc);
+		}
+	}
+	return cg_addr_load(p, res);
+}
+
+gb_internal cgValue cg_emit_matrix_mul_vector(cgProcedure *p, cgValue lhs, cgValue rhs, Type *type) {
+	// matrix * vector: result[i] = sum_k m[i,k] * v[k]
+	Type *xt = base_type(lhs.type);
+	Type *elem = xt->Matrix.elem;
+	i64 R = xt->Matrix.row_count;
+	i64 C = xt->Matrix.column_count;
+
+	cgValue ma = cg_address_from_load_or_generate_local(p, lhs);
+	cgValue va = cg_address_from_load_or_generate_local(p, rhs);
+	cgAddr res = cg_add_local(p, type, nullptr, false);
+
+	for (i64 i = 0; i < R; i++) {
+		cgValue acc = {};
+		for (i64 k = 0; k < C; k++) {
+			cgValue a = cg_emit_load(p, cg_emit_matrix_epi(p, ma, i, k));
+			cgValue b = cg_emit_load(p, cg_emit_array_epi(p, va, k));
+			cgValue prod = cg_emit_arith(p, Token_Mul, a, b, elem);
+			acc = (k == 0) ? prod : cg_emit_arith(p, Token_Add, acc, prod, elem);
+		}
+		cg_emit_store(p, cg_emit_array_epi(p, res.addr, i), acc);
+	}
+	return cg_addr_load(p, res);
+}
+
+gb_internal cgValue cg_emit_vector_mul_matrix(cgProcedure *p, cgValue lhs, cgValue rhs, Type *type) {
+	// vector * matrix: result[j] = sum_k v[k] * m[k,j]
+	Type *yt = base_type(rhs.type);
+	Type *elem = yt->Matrix.elem;
+	i64 R = yt->Matrix.row_count;
+	i64 C = yt->Matrix.column_count;
+
+	cgValue va = cg_address_from_load_or_generate_local(p, lhs);
+	cgValue ma = cg_address_from_load_or_generate_local(p, rhs);
+	cgAddr res = cg_add_local(p, type, nullptr, false);
+
+	for (i64 j = 0; j < C; j++) {
+		cgValue acc = {};
+		for (i64 k = 0; k < R; k++) {
+			cgValue a = cg_emit_load(p, cg_emit_array_epi(p, va, k));
+			cgValue b = cg_emit_load(p, cg_emit_matrix_epi(p, ma, k, j));
+			cgValue prod = cg_emit_arith(p, Token_Mul, a, b, elem);
+			acc = (k == 0) ? prod : cg_emit_arith(p, Token_Add, acc, prod, elem);
+		}
+		cg_emit_store(p, cg_emit_array_epi(p, res.addr, j), acc);
+	}
+	return cg_addr_load(p, res);
+}
+
+gb_internal cgValue cg_emit_arith_matrix(cgProcedure *p, TokenKind op, cgValue lhs, cgValue rhs, Type *type, bool component_wise) {
+	// NOTE(odin-tilde): mirrors lb_emit_arith_matrix.
+	GB_ASSERT(is_type_matrix(lhs.type) || is_type_matrix(rhs.type));
+
+	if (op == Token_Mul && !component_wise) {
+		Type *xt = base_type(lhs.type);
+		Type *yt = base_type(rhs.type);
+
+		if (xt->kind == Type_Matrix) {
+			if (yt->kind == Type_Matrix) {
+				return cg_emit_matrix_mul(p, lhs, rhs, type);
+			} else if (is_type_array_like(yt)) {
+				return cg_emit_matrix_mul_vector(p, lhs, rhs, type);
+			}
+		} else if (is_type_array_like(xt)) {
+			GB_ASSERT(yt->kind == Type_Matrix);
+			return cg_emit_vector_mul_matrix(p, lhs, rhs, type);
+		} else {
+			// scalar * matrix: broadcast the scalar across all elements
+			GB_ASSERT(xt->kind == Type_Basic);
+			GB_ASSERT(yt->kind == Type_Matrix);
+			GB_ASSERT(is_type_matrix(type));
+
+			Type *elem = yt->Matrix.elem;
+			cgValue s = cg_flatten_value(p, cg_emit_conv(p, lhs, elem));
+			cgValue ra = cg_address_from_load_or_generate_local(p, rhs);
+			cgAddr res = cg_add_local(p, type, nullptr, false);
+			i64 n = matrix_type_total_internal_elems(yt);
+			for (i64 i = 0; i < n; i++) {
+				cgValue v = cg_emit_load(p, cg_emit_array_epi(p, ra, i));
+				v = cg_emit_arith(p, Token_Mul, s, v, elem);
+				cg_emit_store(p, cg_emit_array_epi(p, res.addr, i), v);
+			}
+			return cg_addr_load(p, res);
+		}
+	}
+
+	if (is_type_matrix(lhs.type)) {
+		rhs = cg_emit_conv(p, rhs, lhs.type);
+	} else {
+		lhs = cg_emit_conv(p, lhs, rhs.type);
+	}
+
+	Type *xt = base_type(lhs.type);
+	Type *yt = base_type(rhs.type);
+	GB_ASSERT_MSG(are_types_identical(xt, yt), "%s %.*s %s", type_to_string(lhs.type), LIT(token_strings[op]), type_to_string(rhs.type));
+	GB_ASSERT(xt->kind == Type_Matrix);
+
+	Type *elem = xt->Matrix.elem;
+	i64 n = matrix_type_total_internal_elems(xt);
+	cgValue la = cg_address_from_load_or_generate_local(p, lhs);
+	cgValue ra = cg_address_from_load_or_generate_local(p, rhs);
+
+	if (token_is_comparison(op)) {
+		GB_ASSERT_MSG(op == Token_CmpEq || op == Token_NotEq, "matrix comparison %.*s", LIT(token_strings[op]));
+		cgValue acc = {};
+		for (i64 i = 0; i < n; i++) {
+			cgValue a = cg_emit_load(p, cg_emit_array_epi(p, la, i));
+			cgValue b = cg_emit_load(p, cg_emit_array_epi(p, ra, i));
+			cgValue c = cg_emit_comp(p, op, a, b);
+			if (i == 0) {
+				acc = c;
+			} else if (op == Token_CmpEq) {
+				acc = cg_emit_arith(p, Token_And, acc, c, t_bool);
+			} else {
+				acc = cg_emit_arith(p, Token_Or, acc, c, t_bool);
+			}
+		}
+		return cg_emit_conv(p, acc, type);
+	}
+
+	cgAddr res = cg_add_local(p, type, nullptr, false);
+	for (i64 i = 0; i < n; i++) {
+		cgValue a = cg_emit_load(p, cg_emit_array_epi(p, la, i));
+		cgValue b = cg_emit_load(p, cg_emit_array_epi(p, ra, i));
+		cgValue v = cg_emit_arith(p, op, a, b, elem);
+		cg_emit_store(p, cg_emit_array_epi(p, res.addr, i), v);
+	}
+	return cg_addr_load(p, res);
+}
+
+
+
 gb_internal cgValue cg_build_binary_expr(cgProcedure *p, Ast *expr) {
 	ast_node(be, BinaryExpr, expr);
 
@@ -2447,8 +3310,7 @@ gb_internal cgValue cg_build_binary_expr(cgProcedure *p, Ast *expr) {
 	if (is_type_matrix(be->left->tav.type) || is_type_matrix(be->right->tav.type)) {
 		cgValue left = cg_build_expr(p, be->left);
 		cgValue right = cg_build_expr(p, be->right);
-		GB_PANIC("TODO(bill): cg_emit_arith_matrix");
-		// return cg_emit_arith_matrix(p, be->op.kind, left, right, default_type(tv.type), false);
+		return cg_emit_arith_matrix(p, be->op.kind, left, right, default_type(tv.type), false);
 	}
 
 
@@ -2540,7 +3402,11 @@ gb_internal cgValue cg_build_binary_expr(cgProcedure *p, Ast *expr) {
 
 	case Token_CmpAnd:
 	case Token_CmpOr:
-		return cg_build_logical_binary_expr(p, be->op.kind, be->left, be->right, tv.type);
+		// PATCH(odin-tilde): tv.type may be untyped bool (the checker keeps
+		// logical operators untyped like comparisons); normalize to typed
+		// bool the same way the comparison branch above does, otherwise
+		// cg_emit_conv hits type_size_of(untyped bool) and asserts.
+		return cg_build_logical_binary_expr(p, be->op.kind, be->left, be->right, default_type(tv.type));
 
 	case Token_in:
 	case Token_not_in:
@@ -2842,8 +3708,7 @@ cgAddr cg_build_addr_compound_lit(cgProcedure *p, Ast *expr) {
 					data.value = value;
 					data.expr = fv->value;
 					if (bt->kind == Type_Matrix) {
-						GB_PANIC("TODO(bill): Type_Matrix");
-						// data.elem_index = matrix_row_major_index_to_offset(bt, index);
+						data.elem_index = matrix_row_major_index_to_offset(bt, index);
 					} else {
 						data.elem_index = index;
 					}
@@ -2863,8 +3728,7 @@ cgAddr cg_build_addr_compound_lit(cgProcedure *p, Ast *expr) {
 				cgCompoundLitElemTempData data = {};
 				data.value = ev;
 				if (bt->kind == Type_Matrix) {
-						GB_PANIC("TODO(bill): Type_Matrix");
-					// data.elem_index = matrix_row_major_index_to_offset(bt, i);
+					data.elem_index = matrix_row_major_index_to_offset(bt, i);
 				} else {
 					data.elem_index = i;
 				}
@@ -2997,18 +3861,18 @@ cgAddr cg_build_addr_compound_lit(cgProcedure *p, Ast *expr) {
 
 	case Type_Map: {
 		GB_ASSERT(expr->file()->feature_flags & OptInFeatureFlag_DynamicLiterals || build_context.dynamic_literals);
-		GB_PANIC("TODO(bill): map literals");
 
-		// cgValue err = cg_dynamic_map_reserve(p, v.addr, 2*cl->elems.count, pos);
-		// gb_unused(err);
+		// NOTE(odin-tilde): mirrors lb_build_addr_compound_lit
+		cgValue err = cg_dynamic_map_reserve(p, v.addr, 2*cl->elems.count, expr);
+		gb_unused(err);
 
-		// for (Ast *elem : cl->elems) {
-		// 	ast_node(fv, FieldValue, elem);
+		for (Ast *elem : cl->elems) {
+			ast_node(fv, FieldValue, elem);
 
-		// 	cgValue key   = cg_build_expr(p, fv->field);
-		// 	cgValue value = cg_build_expr(p, fv->value);
-		// 	cg_internal_dynamic_map_set(p, v.addr, type, key, value, elem);
-		// }
+			cgValue key   = cg_build_expr(p, fv->field);
+			cgValue value = cg_build_expr(p, fv->value);
+			cg_internal_dynamic_map_set(p, v.addr, type, key, value, elem);
+		}
 		break;
 	}
 
@@ -3054,6 +3918,11 @@ cgAddr cg_build_addr_compound_lit(cgProcedure *p, Ast *expr) {
 			backing = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)global);
 		} else {
 			backing = tb_inst_local(p->func, backing_size, align);
+			// NOTE(odin-tilde): zero-init the backing store so that holes
+			// between range elements read as zero (mirrors cg_add_local)
+			TB_Node *zero = tb_inst_uint(p->func, TB_TYPE_I8, 0);
+			TB_Node *n    = tb_inst_uint(p->func, TB_TYPE_I32, cast(u64)backing_size);
+			tb_inst_memset(p->func, backing, zero, n, align);
 		}
 
 		cgValue data = cg_value(backing, alloc_type_multi_pointer(bt->Slice.elem));
@@ -3283,152 +4152,171 @@ gb_internal cgValue cg_build_unary_and(cgProcedure *p, Ast *expr) {
 		cgAddr addr = cg_build_addr_compound_lit(p, ue_expr);
 		return addr.addr;
 	} else if (ue_expr->kind == Ast_TypeAssertion) {
-		GB_PANIC("TODO(bill): &v.(T)");
-		// if (is_type_tuple(tv.type)) {
-		// 	Type *tuple = tv.type;
-		// 	Type *ptr_type = tuple->Tuple.variables[0]->type;
-		// 	Type *ok_type = tuple->Tuple.variables[1]->type;
+		// NOTE(odin-tilde): &v.(T) — mirrors lb_build_unary_and. For
+		// any/union, `&x.(T)` on the single-value form IS the data pointer
+		// (with a type check); the ,ok form materializes the (ptr, ok) tuple.
+		ast_node(ta, TypeAssertion, ue_expr);
+		TokenPos pos = ast_token(expr).pos;
+		Type *type = type_of_expr(ue_expr);
+		GB_ASSERT(!is_type_tuple(type));
 
-		// 	ast_node(ta, TypeAssertion, ue_expr);
-		// 	TokenPos pos = ast_token(expr).pos;
-		// 	Type *type = type_of_expr(ue_expr);
-		// 	GB_ASSERT(!is_type_tuple(type));
+		if (is_type_tuple(tv.type)) {
+			Type *tuple = tv.type;
+			Type *ptr_type = tuple->Tuple.variables[0]->type;
+			Type *ok_type = tuple->Tuple.variables[1]->type;
 
-		// 	lbValue e = lb_build_expr(p, ta->expr);
-		// 	Type *t = type_deref(e.type);
-		// 	if (is_type_union(t)) {
-		// 		lbValue v = e;
-		// 		if (!is_type_pointer(v.type)) {
-		// 			v = lb_address_from_load_or_generate_local(p, v);
-		// 		}
-		// 		Type *src_type = type_deref(v.type);
-		// 		Type *dst_type = type;
+			cgValue e = cg_build_expr(p, ta->expr);
+			Type *t = type_deref(e.type);
+			if (is_type_union(t)) {
+				cgValue v = e;
+				if (!is_type_pointer(v.type)) {
+					v = cg_address_from_load_or_generate_local(p, v);
+				}
+				Type *src_type = type_deref(v.type);
+				Type *dst_type = type;
 
-		// 		lbValue src_tag = {};
-		// 		lbValue dst_tag = {};
-		// 		if (is_type_union_maybe_pointer(src_type)) {
-		// 			src_tag = lb_emit_comp_against_nil(p, Token_NotEq, v);
-		// 			dst_tag = lb_const_bool(p->module, t_bool, true);
-		// 		} else {
-		// 			src_tag = lb_emit_load(p, lb_emit_union_tag_ptr(p, v));
-		// 			dst_tag = lb_const_union_tag(p->module, src_type, dst_type);
-		// 		}
+				cgValue src_tag = {};
+				cgValue dst_tag = {};
+				if (is_type_union_maybe_pointer(src_type)) {
+					src_tag = cg_emit_comp_against_nil(p, Token_NotEq, v);
+					dst_tag = cg_const_bool(p, t_bool, true);
+				} else {
+					src_tag = cg_emit_load(p, cg_emit_union_tag_ptr(p, v));
+					dst_tag = cg_const_union_tag(p, src_type, dst_type);
+				}
 
-		// 		lbValue ok = lb_emit_comp(p, Token_CmpEq, src_tag, dst_tag);
+				cgValue ok = cg_emit_comp(p, Token_CmpEq, src_tag, dst_tag);
 
-		// 		lbValue data_ptr = lb_emit_conv(p, v, ptr_type);
-		// 		lbAddr res = lb_add_local_generated(p, tuple, true);
-		// 		lbValue gep0 = lb_emit_struct_ep(p, res.addr, 0);
-		// 		lbValue gep1 = lb_emit_struct_ep(p, res.addr, 1);
-		// 		lb_emit_store(p, gep0, lb_emit_select(p, ok, data_ptr, lb_const_nil(p->module, ptr_type)));
-		// 		lb_emit_store(p, gep1, lb_emit_conv(p, ok, ok_type));
-		// 		return lb_addr_load(p, res);
-		// 	} else if (is_type_any(t)) {
-		// 		lbValue v = e;
-		// 		if (is_type_pointer(v.type)) {
-		// 			v = lb_emit_load(p, v);
-		// 		}
+				cgValue data_ptr = cg_emit_conv(p, v, ptr_type);
+				cgAddr res = cg_add_local(p, tuple, nullptr, true);
+				cgValue gep0 = cg_emit_struct_ep(p, res.addr, 0);
+				cgValue gep1 = cg_emit_struct_ep(p, res.addr, 1);
+				cg_emit_store(p, gep0, cg_emit_select(p, ok, data_ptr, cg_const_nil(p, ptr_type)));
+				cg_emit_store(p, gep1, cg_emit_conv(p, ok, ok_type));
+				return cg_addr_load(p, res);
+			} else if (is_type_any(t)) {
+				cgValue v = e;
+				if (is_type_pointer(v.type)) {
+					v = cg_emit_load(p, v);
+				}
 
-		// 		lbValue data_ptr = lb_emit_conv(p, lb_emit_struct_ev(p, v, 0), ptr_type);
-		// 		lbValue any_id = lb_emit_struct_ev(p, v, 1);
-		// 		lbValue id = lb_typeid(p->module, type);
+				cgValue data_ptr = cg_emit_conv(p, cg_emit_struct_ev(p, v, 0), ptr_type);
+				cgValue any_id = cg_emit_struct_ev(p, v, 1);
+				cgValue id = cg_typeid(p, type);
 
-		// 		lbValue ok = lb_emit_comp(p, Token_CmpEq, any_id, id);
+				cgValue ok = cg_emit_comp(p, Token_CmpEq, any_id, id);
 
-		// 		lbAddr res = lb_add_local_generated(p, tuple, false);
-		// 		lbValue gep0 = lb_emit_struct_ep(p, res.addr, 0);
-		// 		lbValue gep1 = lb_emit_struct_ep(p, res.addr, 1);
-		// 		lb_emit_store(p, gep0, lb_emit_select(p, ok, data_ptr, lb_const_nil(p->module, ptr_type)));
-		// 		lb_emit_store(p, gep1, lb_emit_conv(p, ok, ok_type));
-		// 		return lb_addr_load(p, res);
-		// 	} else {
-		// 		GB_PANIC("TODO(bill): type assertion %s", type_to_string(type));
-		// 	}
+				cgAddr res = cg_add_local(p, tuple, nullptr, true);
+				cgValue gep0 = cg_emit_struct_ep(p, res.addr, 0);
+				cgValue gep1 = cg_emit_struct_ep(p, res.addr, 1);
+				cg_emit_store(p, gep0, cg_emit_select(p, ok, data_ptr, cg_const_nil(p, ptr_type)));
+				cg_emit_store(p, gep1, cg_emit_conv(p, ok, ok_type));
+				return cg_addr_load(p, res);
+			} else {
+				GB_PANIC("TODO(bill): type assertion %s", type_to_string(type));
+			}
+		} else {
+			GB_ASSERT(is_type_pointer(tv.type));
 
-		// } else {
-		// 	GB_ASSERT(is_type_pointer(tv.type));
+			bool do_type_check = true;
+			if (build_context.no_type_assert) {
+				// NOTE(odin-tilde): lb also consults per-file feature flags
+				// (OptInFeatureFlag_ForceTypeAssert); not wired up here.
+				do_type_check = false;
+			} else if ((p->state_flags & StateFlag_no_type_assert) != 0) {
+				do_type_check = false;
+			}
 
-		// 	ast_node(ta, TypeAssertion, ue_expr);
-		// 	TokenPos pos = ast_token(expr).pos;
-		// 	Type *type = type_of_expr(ue_expr);
-		// 	GB_ASSERT(!is_type_tuple(type));
+			cgValue e = cg_build_expr(p, ta->expr);
+			Type *t = type_deref(e.type);
+			if (is_type_union(t)) {
+				cgValue v = e;
+				if (!is_type_pointer(v.type)) {
+					v = cg_address_from_load_or_generate_local(p, v);
+				}
+				Type *src_type = type_deref(v.type);
+				Type *dst_type = type;
 
-		// 	lbValue e = lb_build_expr(p, ta->expr);
-		// 	Type *t = type_deref(e.type);
-		// 	if (is_type_union(t)) {
-		// 		lbValue v = e;
-		// 		if (!is_type_pointer(v.type)) {
-		// 			v = lb_address_from_load_or_generate_local(p, v);
-		// 		}
-		// 		Type *src_type = type_deref(v.type);
-		// 		Type *dst_type = type;
+				if (do_type_check) {
+					cgValue src_tag = {};
+					cgValue dst_tag = {};
+					if (is_type_union_maybe_pointer(src_type)) {
+						src_tag = cg_emit_comp_against_nil(p, Token_NotEq, v);
+						dst_tag = cg_const_bool(p, t_bool, true);
+					} else {
+						src_tag = cg_emit_load(p, cg_emit_union_tag_ptr(p, v));
+						dst_tag = cg_const_union_tag(p, src_type, dst_type);
+					}
 
+					isize arg_count = 6;
+					if (build_context.no_rtti) {
+						arg_count = 4;
+					}
 
-		// 		if ((p->state_flags & StateFlag_no_type_assert) == 0) {
-		// 			lbValue src_tag = {};
-		// 			lbValue dst_tag = {};
-		// 			if (is_type_union_maybe_pointer(src_type)) {
-		// 				src_tag = lb_emit_comp_against_nil(p, Token_NotEq, v);
-		// 				dst_tag = lb_const_bool(p->module, t_bool, true);
-		// 			} else {
-		// 				src_tag = lb_emit_load(p, lb_emit_union_tag_ptr(p, v));
-		// 				dst_tag = lb_const_union_tag(p->module, src_type, dst_type);
-		// 			}
+					cgValue ok = cg_emit_comp(p, Token_CmpEq, src_tag, dst_tag);
+					auto args = slice_make<cgValue>(permanent_allocator(), arg_count);
+					args[0] = ok;
+					args[1] = cg_const_string(p, t_string, get_file_path_string(pos.file_id));
+					args[2] = cg_const_int(p, t_i32, pos.line);
+					args[3] = cg_const_int(p, t_i32, pos.column);
 
+					if (!build_context.no_rtti) {
+						args[4] = cg_typeid(p, src_type);
+						args[5] = cg_typeid(p, dst_type);
+					}
 
-		// 			isize arg_count = 6;
-		// 			if (build_context.no_rtti) {
-		// 				arg_count = 4;
-		// 			}
+					char const *name = "type_assertion_check_contextless";
+					if (p->context_stack.count > 0) {
+						name = "type_assertion_check_with_context";
+					}
+					cg_emit_runtime_call(p, name, args);
+				}
 
-		// 			lbValue ok = lb_emit_comp(p, Token_CmpEq, src_tag, dst_tag);
-		// 			auto args = array_make<lbValue>(permanent_allocator(), arg_count);
-		// 			args[0] = ok;
+				cgValue data_ptr = v;
+				return cg_emit_conv(p, data_ptr, tv.type);
+			} else if (is_type_any(t)) {
+				cgValue v = e;
+				if (is_type_pointer(v.type)) {
+					v = cg_emit_load(p, v);
+				}
+				cgValue data_ptr = cg_emit_struct_ev(p, v, 0);
+				if (do_type_check) {
+					GB_ASSERT(!build_context.no_rtti);
 
-		// 			args[1] = lb_find_or_add_entity_string(p->module, get_file_path_string(pos.file_id));
-		// 			args[2] = lb_const_int(p->module, t_i32, pos.line);
-		// 			args[3] = lb_const_int(p->module, t_i32, pos.column);
+					cgValue any_id = cg_emit_struct_ev(p, v, 1);
 
-		// 			if (!build_context.no_rtti) {
-		// 				args[4] = lb_typeid(p->module, src_type);
-		// 				args[5] = lb_typeid(p->module, dst_type);
-		// 			}
-		// 			lb_emit_runtime_call(p, "type_assertion_check", args);
-		// 		}
+					isize arg_count = 6;
+					if (build_context.no_rtti) {
+						arg_count = 4;
+					}
 
-		// 		lbValue data_ptr = v;
-		// 		return lb_emit_conv(p, data_ptr, tv.type);
-		// 	} else if (is_type_any(t)) {
-		// 		lbValue v = e;
-		// 		if (is_type_pointer(v.type)) {
-		// 			v = lb_emit_load(p, v);
-		// 		}
-		// 		lbValue data_ptr = lb_emit_struct_ev(p, v, 0);
-		// 		if ((p->state_flags & StateFlag_no_type_assert) == 0) {
-		// 			GB_ASSERT(!build_context.no_rtti);
+					cgValue id = cg_typeid(p, type);
+					cgValue ok = cg_emit_comp(p, Token_CmpEq, any_id, id);
+					auto args = slice_make<cgValue>(permanent_allocator(), arg_count);
+					args[0] = ok;
+					args[1] = cg_const_string(p, t_string, get_file_path_string(pos.file_id));
+					args[2] = cg_const_int(p, t_i32, pos.line);
+					args[3] = cg_const_int(p, t_i32, pos.column);
 
-		// 			lbValue any_id = lb_emit_struct_ev(p, v, 1);
+					if (!build_context.no_rtti) {
+						args[4] = any_id;
+						args[5] = id;
+					}
 
-		// 			lbValue id = lb_typeid(p->module, type);
-		// 			lbValue ok = lb_emit_comp(p, Token_CmpEq, any_id, id);
-		// 			auto args = array_make<lbValue>(permanent_allocator(), 6);
-		// 			args[0] = ok;
+					char const *name = "type_assertion_check_contextless";
+					if (p->context_stack.count > 0) {
+						name = "type_assertion_check_with_context";
+					}
+					cg_emit_runtime_call(p, name, args);
+				}
 
-		// 			args[1] = lb_find_or_add_entity_string(p->module, get_file_path_string(pos.file_id));
-		// 			args[2] = lb_const_int(p->module, t_i32, pos.line);
-		// 			args[3] = lb_const_int(p->module, t_i32, pos.column);
-
-		// 			args[4] = any_id;
-		// 			args[5] = id;
-		// 			lb_emit_runtime_call(p, "type_assertion_check", args);
-		// 		}
-
-		// 		return lb_emit_conv(p, data_ptr, tv.type);
-		// 	} else {
-		// 		GB_PANIC("TODO(bill): type assertion %s", type_to_string(type));
-		// 	}
-		// }
+				return cg_emit_conv(p, data_ptr, tv.type);
+			} else {
+				GB_PANIC("TODO(bill): type assertion %s", type_to_string(type));
+			}
+		}
 	}
+
 
 	return cg_build_addr_ptr(p, ue->expr);
 }
@@ -3960,6 +4848,17 @@ gb_internal cgValue cg_internal_dynamic_map_get_ptr(cgProcedure *p, cgValue cons
 }
 
 
+gb_internal cgValue cg_dynamic_map_reserve(cgProcedure *p, cgValue const &map_ptr, isize const capacity, Ast *node) {
+	TEMPORARY_ALLOCATOR_GUARD();
+
+	auto args = slice_make<cgValue>(temporary_allocator(), 4);
+	args[0] = cg_emit_conv(p, map_ptr, t_rawptr);
+	args[1] = cg_builtin_map_info(p, base_type(type_deref(map_ptr.type)));
+	args[2] = cg_const_int(p, t_uint, capacity);
+	args[3] = cg_emit_source_code_location_as_global(p, node);
+	return cg_emit_runtime_call(p, "__dynamic_map_reserve", args);
+}
+
 gb_internal void cg_internal_dynamic_map_set(cgProcedure *p, cgValue const &map_ptr, Type *map_type,
                                              cgValue const &map_key, cgValue const &map_value, Ast *node) {
 	TEMPORARY_ALLOCATOR_GUARD();
@@ -4312,9 +5211,9 @@ gb_internal cgAddr cg_build_addr_internal(cgProcedure *p, Ast *expr) {
 				a = cg_addr_get_ptr(p, addr);
 			}
 
-			GB_ASSERT(is_type_array(expr->tav.type));
-			GB_PANIC("TODO(bill): cg_addr_swizzle");
-			// return cg_addr_swizzle(a, expr->tav.type, swizzle_count, swizzle_indices);
+			Type *swizzle_result_type = type_deref(expr->tav.type);
+			GB_ASSERT(is_type_array(swizzle_result_type) || is_type_simd_vector(swizzle_result_type));
+			return cg_addr_swizzle(a, swizzle_result_type, swizzle_count, swizzle_indices);
 		}
 
 		Selection sel = lookup_field(type, sel_node->Ident.interned, false);
@@ -4327,6 +5226,30 @@ gb_internal cgAddr cg_build_addr_internal(cgProcedure *p, Ast *expr) {
 
 		{
 			cgAddr addr = cg_build_addr(p, se->expr);
+			if (sel.is_bit_field) {
+				// NOTE(odin-tilde): mirrors lb — walk the sub-selection to
+				// the bit_field value, then hand back a BitField addr.
+				Selection sub_sel = sel;
+				sub_sel.index.count -= 1;
+
+				cgValue ptr = cg_addr_get_ptr(p, addr);
+				if (sub_sel.index.count > 0) {
+					ptr = cg_emit_deep_field_gep(p, ptr, sub_sel);
+				}
+				if (is_type_pointer(type_deref(ptr.type))) {
+					ptr = cg_emit_load(p, ptr);
+				}
+
+				Type *bf_type = base_type(type_deref(ptr.type));
+				GB_ASSERT(bf_type->kind == Type_BitField);
+
+				i32 index = cast(i32)sel.index[sel.index.count-1];
+				Entity *f = bf_type->BitField.fields[index];
+				u8 bit_size = bf_type->BitField.bit_sizes[index];
+				i64 bit_offset = bf_type->BitField.bit_offsets[index];
+
+				return cg_addr_bit_field(ptr, f->type, bit_offset, bit_size);
+			}
 			if (addr.kind == cgAddr_Map) {
 				cgValue v = cg_addr_load(p, addr);
 				cgValue a = cg_address_from_load_or_generate_local(p, v);
@@ -4403,8 +5326,51 @@ gb_internal cgAddr cg_build_addr_internal(cgProcedure *p, Ast *expr) {
 		return cg_addr(cg_address_from_load_or_generate_local(p, cg_build_expr(p, expr)));
 	case_end;
 
+	case_ast_node(tc, TypeCast, expr);
+		// NOTE(odin-tilde): mirrors lb_build_addr_internal — an rvalue cast
+		// (e.g. `(transmute([2]u64)x)[0]`) is addressed through a generated local
+		{
+			Type *type = type_of_expr(expr);
+			cgValue x = cg_build_expr(p, tc->expr);
+			cgValue e = {};
+			switch (tc->token.kind) {
+			case Token_cast:
+				e = cg_emit_conv(p, x, type);
+				break;
+			case Token_transmute:
+				e = cg_emit_transmute(p, x, type);
+				break;
+			default:
+				GB_PANIC("Invalid AST TypeCast");
+			}
+			return cg_addr(cg_address_from_load_or_generate_local(p, e));
+		}
+	case_end;
+
+	case_ast_node(ac, AutoCast, expr);
+		return cg_build_addr(p, ac->expr);
+	case_end;
+
 	case_ast_node(cl, CompoundLit, expr);
 		return cg_build_addr_compound_lit(p, expr);
+	case_end;
+
+	case_ast_node(ie, MatrixIndexExpr, expr);
+		// NOTE(odin-tilde): mirrors lb_build_addr_internal's
+		// MatrixIndexExpr case (minus the bounds check, consistent with
+		// the rest of this backend).
+		{
+			Type *t = base_type(type_of_expr(ie->expr));
+			bool deref = is_type_pointer(t);
+			cgValue m = cg_build_addr_ptr(p, ie->expr);
+			if (deref) {
+				m = cg_emit_load(p, m);
+			}
+			cgValue row_index    = cg_emit_conv(p, cg_build_expr(p, ie->row_index), t_int);
+			cgValue column_index = cg_emit_conv(p, cg_build_expr(p, ie->column_index), t_int);
+			cgValue elem = cg_emit_matrix_ep(p, m, row_index, column_index);
+			return cg_addr(elem);
+		}
 	case_end;
 
 	}

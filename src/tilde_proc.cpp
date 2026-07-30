@@ -1,3 +1,50 @@
+gb_internal TB_DataType cg_gpr_blob_dt(i64 size) {
+	if (size <= 1) return TB_TYPE_I8;
+	if (size == 2) return TB_TYPE_I16;
+	if (size <= 4) return TB_TYPE_I32;
+	GB_ASSERT(size <= 8);
+	return TB_TYPE_I64;
+}
+
+gb_internal i64 cg_gpr_blob_capacity(i64 size) {
+	if (size <= 1) return 1;
+	if (size == 2) return 2;
+	if (size <= 4) return 4;
+	GB_ASSERT(size <= 8);
+	return 8;
+}
+
+gb_internal TB_Node *cg_load_gpr_blob(cgProcedure *p, TB_Node *addr, i64 size, i64 align) {
+	TB_DataType transport = cg_gpr_blob_dt(size);
+	switch (size) {
+	case 1: case 2: case 4: case 8:
+		return tb_inst_load(p->func, transport, addr, cast(TB_CharUnits)align, false);
+	}
+	// NOTE(odin-tilde): odd sizes (3, 5, 6, 7) must be composed from chunks
+	// that never read past `size` — a direct transport-width load would
+	// over-read the object (potentially past a page boundary).
+	TB_Node *blob = nullptr;
+	i64 offset = 0;
+	i64 remaining = size;
+	while (remaining > 0) {
+		TB_DataType cdt;
+		i64 csize;
+		if (remaining >= 4)      { cdt = TB_TYPE_I32; csize = 4; }
+		else if (remaining >= 2) { cdt = TB_TYPE_I16; csize = 2; }
+		else                     { cdt = TB_TYPE_I8;  csize = 1; }
+		TB_Node *chunk_addr = offset ? tb_inst_member_access(p->func, addr, offset) : addr;
+		TB_Node *chunk = tb_inst_load(p->func, cdt, chunk_addr, 1, false);
+		chunk = tb_inst_zxt(p->func, chunk, transport);
+		if (offset) {
+			chunk = tb_inst_shl(p->func, chunk, tb_inst_uint(p->func, transport, cast(u64)(offset*8)), TB_ARITHMATIC_NONE);
+		}
+		blob = blob ? tb_inst_or(p->func, blob, chunk) : chunk;
+		offset += csize;
+		remaining -= csize;
+	}
+	return blob;
+}
+
 gb_internal TB_FunctionPrototype *cg_procedure_type_as_prototype(cgModule *m, Type *type) {
 	GB_ASSERT(is_type_proc(type));
 	mutex_lock(&m->proc_proto_mutex);
@@ -283,7 +330,11 @@ gb_internal void cg_procedure_begin(cgProcedure *p) {
 		switch (rule) {
 		case TB_PASSING_DIRECT: {
 			TB_Node *param = tb_inst_param(p->func, param_index++);
-			param_ptr = tb_inst_local(p->func, size, align);
+			// NOTE(odin-tilde): odd-sized aggregates (3, 5, 6, 7 bytes) arrive
+			// as a transport-width integer blob (I32/I64); the local must be
+			// big enough for the full blob width, not just the type size.
+			TB_CharUnits local_size = size <= 8 ? cast(TB_CharUnits)cg_gpr_blob_capacity(size) : size;
+			param_ptr = tb_inst_local(p->func, local_size, align);
 			tb_inst_store(p->func, param->dt, param_ptr, param, align, false);
 		} break;
 		case TB_PASSING_INDIRECT: {
@@ -339,6 +390,12 @@ gb_internal void cg_procedure_begin(cgProcedure *p) {
 		TB_Node *param_ptr = tb_inst_param(p->func, param_count-1);
 		cgValue local = cg_value(param_ptr, t_context_ptr);
 		cgAddr addr = cg_addr(local);
+		// NOTE(odin-tilde): the implicit context parameter must keep
+		// cgAddr_Context kind (mirrors lb_push_context_onto_stack_from_implicit_parameter);
+		// otherwise `context.x = v` stores bypass the copy-on-write
+		// context machinery and clobber the caller-visible context
+		// (inner scopes leaked writes to outer scopes).
+		addr.kind = cgAddr_Context;
 		map_set(&p->variable_map, e, addr);
 
 
@@ -643,6 +700,16 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 			param_entity = param_entities[param_entity_index++];
 		} while (param_entity->kind != Entity_Variable);
 		Type *param_type = param_entity->type;
+		if (pt->c_vararg && pt->variadic && param_entity_index-1 == pt->variadic_index) {
+			// NOTE(odin-tilde): c varargs — the individual vararg values are
+			// appended after the fixed parameters, so conv to the slice's
+			// element type and keep consuming the variadic entity for all
+			// remaining args (otherwise a single value gets conv'd to the
+			// slice type itself, e.g. os._open's mode argument).
+			GB_ASSERT(param_type->kind == Type_Slice);
+			param_type = param_type->Slice.elem;
+			param_entity_index--;
+		}
 		cgValue arg = args[i];
 		arg = cg_emit_conv(p, arg, param_type);
 		arg = cg_flatten_value(p, arg);
@@ -660,18 +727,11 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 				// memory in this backend (cgValue_Addr), so load the blob
 				// as an integer of the same size. The callee side stores
 				// the parameter into a local with the same integer dt.
+				// Odd sizes (3, 5, 6, 7) are composed from chunk loads that
+				// never read past the object (see cg_load_gpr_blob).
 				i64 sz = type_size_of(param_type);
-				TB_DataType dt = TB_TYPE_I64;
-				switch (sz) {
-				case 1: dt = TB_TYPE_I8;  break;
-				case 2: dt = TB_TYPE_I16; break;
-				case 4: dt = TB_TYPE_I32; break;
-				case 8: dt = TB_TYPE_I64; break;
-				default: GB_PANIC("unsupported TB_PASSING_DIRECT aggregate size %d for '%s'", cast(int)sz, type_to_string(param_type));
-				}
 				cgValue arg_ptr = cg_address_from_load_or_generate_local(p, arg);
-				TB_CharUnits align = cast(TB_CharUnits)type_align_of(param_type);
-				param = tb_inst_load(p->func, dt, arg_ptr.node, align, false);
+				param = cg_load_gpr_blob(p, arg_ptr.node, sz, type_align_of(param_type));
 			} else {
 				param = arg.node;
 			}
@@ -745,10 +805,11 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 				// NOTE(new-tb): small aggregates returned DIRECT come back as
 				// an integer register blob (same as the split-return path
 				// below); store it into a local to reconstruct the aggregate
-				// so downstream sees the usual address-based rvalue.
+				// so downstream sees the usual address-based rvalue. The
+				// local must fit the transport-width blob (odd sizes round up).
 				TB_CharUnits size  = cast(TB_CharUnits)type_size_of(rt);
 				TB_CharUnits align = cast(TB_CharUnits)type_align_of(rt);
-				TB_Node *addr = tb_inst_local(p->func, size, align);
+				TB_Node *addr = tb_inst_local(p->func, size <= 8 ? cast(TB_CharUnits)cg_gpr_blob_capacity(size) : size, align);
 				tb_inst_store(p->func, node->dt, addr, node, align, false);
 				return cg_lvalue_addr(addr, rt);
 			}
@@ -776,7 +837,7 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 				// struct-like returns passed in registers
 				TB_CharUnits size  = cast(TB_CharUnits)type_size_of(end_type);
 				TB_CharUnits align = cast(TB_CharUnits)type_align_of(end_type);
-				TB_Node *addr = tb_inst_local(p->func, size, align);
+				TB_Node *addr = tb_inst_local(p->func, size <= 8 ? cast(TB_CharUnits)cg_gpr_blob_capacity(size) : size, align);
 				tb_inst_store(p->func, res->dt, addr, res, align, false);
 				multi->values[pt->result_count-1] = cg_lvalue_addr(addr, end_type);
 			} else {
@@ -1071,10 +1132,16 @@ gb_internal cgValue cg_build_call_expr_internal(cgProcedure *p, Ast *expr) {
 			GB_ASSERT(e->kind == Entity_Variable);
 
 			if (pt->variadic && param_index == pt->variadic_index) {
+				// NOTE(odin-tilde): mirror lb — the variadic parameter is never
+				// conv'd to its slice type. For !c_vararg it already holds the
+				// packed slice (or nil when missing); for c_vararg the varargs
+				// were appended individually and pass through untouched.
 				if (!is_c_vararg && args[arg_index].node == nullptr) {
 					args[arg_index++] = cg_const_nil(p, e->type);
 					continue;
 				}
+				arg_index++;
+				continue;
 			}
 
 			cgValue arg = args[arg_index];
@@ -1090,7 +1157,65 @@ gb_internal cgValue cg_build_call_expr_internal(cgProcedure *p, Ast *expr) {
 	isize final_count = is_c_vararg ? args.count : internal_param_count;
 	auto call_args = slice(args, 0, final_count);
 
-	return cg_emit_call(p, value, call_args);
+	cgValue result = cg_emit_call(p, value, call_args);
+
+	// NOTE(odin-tilde): @(deferred_in/out=...) procedure attributes — mirrors
+	// lb_build_call_expr: after the call, register the associated deferred
+	// procedure on the caller's current scope so it runs at scope exit
+	// (e.g. sync.mutex_guard registering mutex_unlock).
+	if (proc_entity != nullptr && proc_entity->kind == Entity_Procedure &&
+	    entity_has_deferred_procedure(proc_entity)) {
+		DeferredProcedureKind kind = proc_entity->Procedure.deferred_procedure.kind;
+		Entity *deferred_entity = proc_entity->Procedure.deferred_procedure.entity;
+		cgValue deferred = cg_find_procedure_value_from_entity(p->module, deferred_entity);
+
+		bool by_ptr = false;
+		Array<cgValue> result_as_args = {};
+		switch (kind) {
+		case DeferredProcedure_none:
+			break;
+		case DeferredProcedure_in_by_ptr:
+			by_ptr = true;
+			/*fallthrough*/
+		case DeferredProcedure_in:
+			result_as_args = array_make<cgValue>(heap_allocator(), call_args.count);
+			for_array(i, call_args) {
+				result_as_args[i] = call_args[i];
+			}
+			break;
+		case DeferredProcedure_out_by_ptr:
+			by_ptr = true;
+			/*fallthrough*/
+		case DeferredProcedure_out:
+			result_as_args = array_make<cgValue>(heap_allocator(), 0, 2);
+			cg_append_tuple_values(p, &result_as_args, result);
+			break;
+		case DeferredProcedure_in_out_by_ptr:
+			by_ptr = true;
+			/*fallthrough*/
+		case DeferredProcedure_in_out:
+			{
+				result_as_args = array_make<cgValue>(heap_allocator(), 0, call_args.count+2);
+				for_array(i, call_args) {
+					array_add(&result_as_args, call_args[i]);
+				}
+				cg_append_tuple_values(p, &result_as_args, result);
+			}
+			break;
+		}
+		if (by_ptr) {
+			for_array(i, result_as_args) {
+				cgValue arg_ptr = cg_address_from_load_or_generate_local(p, result_as_args[i]);
+				result_as_args[i] = arg_ptr;
+			}
+		}
+
+		if (kind != DeferredProcedure_none) {
+			cg_add_defer_proc(p, p->scope_index, deferred, slice(result_as_args, 0, result_as_args.count));
+		}
+	}
+
+	return result;
 }
 
 
@@ -1217,31 +1342,38 @@ gb_internal cgProcedure *cg_equal_proc_for_type(cgModule *m, Type *type) {
 				keys[entry_offset].key   = 0;
 				keys[entry_offset].value = region;
 				entry_offset += 1;
-
-				tb_inst_set_control(p->func, region);
-				cgValue ok = cg_const_bool(p, t_bool, true);
-				cg_build_return_stmt_internal_single(p, ok);
 			}
-
 			for (isize i = 0; i < type->Union.variants.count; i++) {
 				TB_Node *region = cg_control_region(p, "bcase");
 				Type *variant = type->Union.variants[i];
 				keys[entry_offset+i].key = union_variant_index_checked(type, variant);
 				keys[entry_offset+i].value = region;
+			}
 
-				tb_inst_set_control(p->func, region);
+			// NOTE(odin-tilde): the switch must be emitted BEFORE the case
+			// bodies — tb_builder_label_set nulls the builder's current
+			// block when the target region has no predecessors, so entering
+			// a case region before the branch registers its edge leaves the
+			// builder with no control block and the next emission segfaults.
+			tb_inst_set_control(p->func, switch_region);
+			TB_DataType tag_dt = cg_data_type(lhs_tag.type);
+			GB_ASSERT(lhs_tag.kind == cgValue_Value);
+			tb_inst_branch(p->func, tag_dt, lhs_tag.node, false_region, entry_count, keys);
+
+			if (type->Union.kind != UnionType_no_nil) {
+				tb_inst_set_control(p->func, keys[0].value);
+				cgValue ok = cg_const_bool(p, t_bool, true);
+				cg_build_return_stmt_internal_single(p, ok);
+			}
+			for (isize i = 0; i < type->Union.variants.count; i++) {
+				tb_inst_set_control(p->func, keys[entry_offset+i].value);
+				Type *variant = type->Union.variants[i];
 				Type *vp = alloc_type_pointer(variant);
 				cgValue left  = cg_emit_load(p, cg_emit_conv(p, lhs, vp));
 				cgValue right = cg_emit_load(p, cg_emit_conv(p, rhs, vp));
 				cgValue ok = cg_emit_comp(p, Token_CmpEq, left, right);
 				cg_build_return_stmt_internal_single(p, ok);
 			}
-
-
-			tb_inst_set_control(p->func, switch_region);
-			TB_DataType tag_dt = cg_data_type(lhs_tag.type);
-			GB_ASSERT(lhs_tag.kind == cgValue_Value);
-			tb_inst_branch(p->func, tag_dt, lhs_tag.node, false_region, entry_count, keys);
 
 			tb_inst_set_control(p->func, false_region);
 			tb_inst_ret(p->func, 1, &node_false);

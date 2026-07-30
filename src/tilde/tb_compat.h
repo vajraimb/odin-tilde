@@ -171,7 +171,7 @@ gb_internal TB_Node *tb_inst_float32(TB_Function *f, float imm)                 
 gb_internal TB_Node *tb_inst_float64(TB_Function *f, double imm)                   { return tb_builder_float64(cg_tb_g(f), imm); }
 
 // poison ~ arbitrary value; zero is a valid "arbitrary value"
-gb_internal TB_Node *tb_inst_poison(TB_Function *f, TB_DataType dt)                { return tb_builder_uint(cg_tb_g(f), dt, 0); }
+gb_internal TB_Node *tb_inst_poison(TB_Function *f, TB_DataType dt)                { if (dt.type == TB_TAG_F32) return tb_builder_float32(cg_tb_g(f), 0); if (dt.type == TB_TAG_F64) return tb_builder_float64(cg_tb_g(f), 0); return tb_builder_uint(cg_tb_g(f), dt, 0); }
 
 // ------------------------------------------------------------------
 // casts (old arg order: f, src, dt)
@@ -343,6 +343,41 @@ gb_internal TB_Node *tb_inst_popcount(TB_Function *f, TB_Node *n) {
 	}
 	x = cg_tb_swar_popcount64(f, x);
 	if (bits < 64) {
+		x = tb_inst_trunc(f, x, in_dt);
+	}
+	return x;
+}
+
+// NOTE(odin-tilde): like CLZ/CTZ/POPCNT there is no x64 isel for a
+// bitreverse node, so expand into the classic SWAR swap sequence plus a
+// byte swap. Sub-64-bit inputs are reversed in the 64-bit domain and then
+// shifted down so the reversed low bits land in place.
+gb_internal TB_Node *tb_inst_reverse_bits(TB_Function *f, TB_Node *n) {
+	TB_DataType in_dt = n->dt;
+	int bits = cg_tb_int_bits(in_dt);
+	TB_Node *x = n;
+	if (bits < 64) {
+		x = tb_inst_zxt(f, x, TB_TYPE_I64);
+	}
+
+	TB_Node *m1 = tb_inst_uint(f, TB_TYPE_I64, 0x5555555555555555ull);
+	TB_Node *m2 = tb_inst_uint(f, TB_TYPE_I64, 0x3333333333333333ull);
+	TB_Node *m4 = tb_inst_uint(f, TB_TYPE_I64, 0x0f0f0f0f0f0f0f0full);
+	TB_Node *one  = tb_inst_uint(f, TB_TYPE_I64, 1);
+	TB_Node *two  = tb_inst_uint(f, TB_TYPE_I64, 2);
+	TB_Node *four = tb_inst_uint(f, TB_TYPE_I64, 4);
+
+	// x = ((x >> s) & m) | ((x & m) << s) for s in 1, 2, 4
+	x = tb_inst_or(f, tb_inst_and(f, tb_inst_shr(f, x, one), m1),
+	               tb_inst_shl(f, tb_inst_and(f, x, m1), one, TB_ARITHMATIC_NONE));
+	x = tb_inst_or(f, tb_inst_and(f, tb_inst_shr(f, x, two), m2),
+	               tb_inst_shl(f, tb_inst_and(f, x, m2), two, TB_ARITHMATIC_NONE));
+	x = tb_inst_or(f, tb_inst_and(f, tb_inst_shr(f, x, four), m4),
+	               tb_inst_shl(f, tb_inst_and(f, x, m4), four, TB_ARITHMATIC_NONE));
+	x = tb_inst_bswap(f, x);
+
+	if (bits < 64) {
+		x = tb_inst_shr(f, x, tb_inst_uint(f, TB_TYPE_I64, 64 - bits));
 		x = tb_inst_trunc(f, x, in_dt);
 	}
 	return x;

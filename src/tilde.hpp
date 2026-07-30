@@ -73,6 +73,7 @@ enum cgAddrKind {
 	cgAddr_Map,
 	cgAddr_Context,
 	cgAddr_SoaVariable,
+	cgAddr_BitField,
 
 	cgAddr_RelativePointer,
 	cgAddr_RelativeSlice,
@@ -113,6 +114,11 @@ struct cgAddr {
 			Type *type;
 			Slice<i32> indices;
 		} swizzle_large;
+		struct {
+			Type *type;
+			i64   bit_offset;
+			u8    bit_size;
+		} bitfield;
 	};
 };
 
@@ -301,6 +307,15 @@ gb_internal isize cg_global_const_calculate_region_count(ExactValue const &value
 gb_internal i64   cg_global_const_calculate_region_count_from_basic_type(Type *type);
 gb_internal bool  cg_global_const_add_region(cgModule *m, ExactValue const &value, Type *type, TB_Global *global, i64 offset);
 
+// Small aggregates (<= 8 bytes, e.g. [3]u8 RGB_Pixel) are classified
+// TB_PASSING_DIRECT on System-V and travel in a single GPR as an integer
+// blob. These helpers pick the transport dt, load the blob from memory
+// without ever reading past `size`, and give the local capacity needed to
+// store a transport-width blob for a `size`-byte aggregate.
+gb_internal TB_DataType cg_gpr_blob_dt(i64 size);
+gb_internal i64         cg_gpr_blob_capacity(i64 size);
+gb_internal TB_Node *   cg_load_gpr_blob(cgProcedure *p, TB_Node *addr, i64 size, i64 align);
+
 gb_internal String cg_get_entity_name(cgModule *m, Entity *e);
 
 gb_internal cgValue cg_value(TB_Global *  g,    Type *type);
@@ -311,6 +326,8 @@ gb_internal cgValue cg_value(TB_Node *    node, Type *type);
 
 gb_internal cgAddr cg_addr(cgValue const &value);
 gb_internal cgAddr cg_addr_map(cgValue addr, cgValue map_key, Type *map_type, Type *map_result);
+gb_internal cgAddr cg_addr_bit_field(cgValue addr, Type *type, i64 bit_offset, u8 bit_size);
+gb_internal cgAddr cg_addr_swizzle(cgValue addr, Type *type, u8 swizzle_count, u8 swizzle_indices[4]);
 
 gb_internal u64 cg_typeid_as_u64(cgModule *m, Type *type);
 gb_internal cgValue cg_type_info(cgProcedure *p, Type *type);
@@ -363,6 +380,8 @@ gb_internal cgValue cg_typeid(cgProcedure *m, Type *t);
 gb_internal cgValue cg_emit_ptr_offset(cgProcedure *p, cgValue ptr, cgValue index);
 gb_internal cgValue cg_emit_array_ep(cgProcedure *p, cgValue s, cgValue index);
 gb_internal cgValue cg_emit_array_epi(cgProcedure *p, cgValue s, i64 index);
+gb_internal cgValue cg_emit_matrix_ep(cgProcedure *p, cgValue s, cgValue row, cgValue column);
+gb_internal cgValue cg_emit_matrix_epi(cgProcedure *p, cgValue s, i64 row, i64 column);
 gb_internal cgValue cg_emit_struct_ep(cgProcedure *p, cgValue s, i64 index);
 gb_internal cgValue cg_emit_deep_field_gep(cgProcedure *p, cgValue e, Selection const &sel);
 gb_internal cgValue cg_emit_struct_ev(cgProcedure *p, cgValue s, i64 index);
@@ -374,7 +393,20 @@ gb_internal cgValue cg_const_union_tag(cgProcedure *p, Type *u, Type *v);
 gb_internal cgValue cg_emit_comp_against_nil(cgProcedure *p, TokenKind op_kind, cgValue x);
 gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left, cgValue right);
 gb_internal cgValue cg_emit_arith(cgProcedure *p, TokenKind op, cgValue lhs, cgValue rhs, Type *type);
+gb_internal cgValue cg_emit_arith_matrix(cgProcedure *p, TokenKind op, cgValue lhs, cgValue rhs, Type *type, bool component_wise);
 gb_internal cgValue cg_emit_unary_arith(cgProcedure *p, TokenKind op, cgValue x, Type *type);
+
+// NOTE(odin-tilde): 128-bit integers (u128/i128 + endian variants) are opaque
+// 16-byte aggregates; these helpers lower their ops to u64 limb pairs.
+gb_internal bool     cg_is_type_integer_128(Type *t);
+gb_internal bool     cg_u128_is_swapped(Type *t);
+gb_internal TB_Node *cg_emit_u128_limb_load(cgProcedure *p, TB_Node *base_ptr, bool swapped, int limb);
+gb_internal void     cg_emit_u128_limb_store(cgProcedure *p, TB_Node *base_ptr, bool swapped, int limb, TB_Node *n);
+gb_internal TB_Node *cg_u128_addr_of(cgProcedure *p, cgValue v);
+gb_internal cgValue  cg_u128_make_value(cgProcedure *p, Type *type, bool swapped, TB_Node *lo, TB_Node *hi);
+gb_internal cgValue  cg_emit_arith_u128(cgProcedure *p, TokenKind op, cgValue lhs, cgValue rhs, Type *type);
+gb_internal cgValue  cg_emit_comp_u128(cgProcedure *p, TokenKind op_kind, cgValue left, cgValue right);
+gb_internal cgValue  cg_emit_conv_int128(cgProcedure *p, cgValue value, Type *src, Type *dst, Type *t);
 gb_internal void    cg_emit_increment(cgProcedure *p, cgValue addr);
 
 gb_internal cgProcedure *cg_equal_proc_for_type (cgModule *m, Type *type);
@@ -389,6 +421,7 @@ gb_internal bool    cg_emit_goto(cgProcedure *p, TB_Node *control_region);
 
 gb_internal cgBranchRegions cg_lookup_branch_regions(cgProcedure *p, Ast *ident);
 gb_internal void            cg_emit_defer_stmts(cgProcedure *p, cgDeferExitKind kind, TB_Node *control_region);
+gb_internal void            cg_add_defer_proc(cgProcedure *p, isize scope_index, cgValue deferred, Slice<cgValue> const &result_as_args);
 
 gb_internal TB_Node *cg_control_region(cgProcedure *p, char const *name);
 gb_internal TB_Node *cg_control_region_loop(cgProcedure *p, char const *name);
@@ -406,5 +439,6 @@ gb_internal cgValue cg_emit_source_code_location_as_global(cgProcedure *p, Ast *
 
 
 gb_internal cgValue cg_internal_dynamic_map_get_ptr(cgProcedure *p, cgValue const &map_ptr, cgValue const &key);
+gb_internal cgValue cg_dynamic_map_reserve(cgProcedure *p, cgValue const &map_ptr, isize const capacity, Ast *node);
 gb_internal void cg_internal_dynamic_map_set(cgProcedure *p, cgValue const &map_ptr, Type *map_type,
                                              cgValue const &map_key, cgValue const &map_value, Ast *node);
