@@ -13,6 +13,50 @@ struct LinkerData {
 gb_internal i32 system_exec_command_line_app(char const *name, char const *fmt, ...);
 gb_internal bool system_exec_command_line_app_output(char const *command, gbString *output);
 
+// NOTE(odin-tilde): Apple's ld stamps a random LC_UUID under -no-pie, which
+// breaks byte-for-byte reproducible builds even when every input is
+// identical (dyld only requires the load command to exist, so -no_uuid is
+// not an option). Rewrite the UUID to a fixed value after linking.
+gb_internal void pin_darwin_lc_uuid(String path) {
+	char const *cpath = alloc_cstring(temporary_allocator(), path);
+	FILE *f = fopen(cpath, "r+b");
+	if (f == nullptr) {
+		return;
+	}
+	u8 header[32] = {};
+	bool ok = fread(header, 1, 32, f) == 32;
+	u32 magic = *cast(u32 *)&header[0];
+	bool is64 = magic == 0xfeedfacfu; // MH_MAGIC_64, little-endian hosts only
+	bool is32 = magic == 0xfeedfaceu; // MH_MAGIC
+	if (ok && (is64 || is32)) {
+		u32 ncmds = *cast(u32 *)&header[16];
+		u32 off   = is64 ? 32 : 28;
+		for (u32 i = 0; i < ncmds; i++) {
+			u8 cmdhdr[8] = {};
+			if (fseek(f, off, SEEK_SET) != 0 || fread(cmdhdr, 1, 8, f) != 8) {
+				break;
+			}
+			u32 cmd     = *cast(u32 *)&cmdhdr[0];
+			u32 cmdsize = *cast(u32 *)&cmdhdr[4];
+			if (cmdsize < 8) {
+				break;
+			}
+			if (cmd == 0x1b /* LC_UUID */) {
+				static u8 const fixed_uuid[16] = {};
+				if (fseek(f, off + 8, SEEK_SET) == 0) {
+					size_t wrote = fwrite(fixed_uuid, 1, 16, f);
+					if (wrote != 16) {
+						gb_printf_err("warning: failed to pin LC_UUID (%td/16 bytes written)\n", wrote);
+					}
+				}
+				break;
+			}
+			off += cmdsize;
+		}
+	}
+	fclose(f);
+}
+
 // No longer required not that LLVM 14 is removed(?)
 gb_internal void linker_enable_system_library_linking(LinkerData *ld) {
 	ld->needs_system_library_linked = true;
@@ -1035,6 +1079,12 @@ try_cross_linking:;
 
 			if (result) {
 				return result;
+			}
+
+			// NOTE(odin-tilde): see pin_darwin_lc_uuid — pin the random
+			// LC_UUID so tilde builds are byte-for-byte reproducible.
+			if (build_context.metrics.os == TargetOs_darwin && build_context.tilde_backend) {
+				pin_darwin_lc_uuid(output_filename);
 			}
 
 			if (is_osx && build_context.ODIN_DEBUG) {

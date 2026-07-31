@@ -221,6 +221,11 @@ struct cgProcedure {
 
 	PtrMap<Entity *, cgAddr> variable_map;
 	PtrMap<Entity *, cgAddr> soa_values_map;
+
+	// NOTE(odin-tilde): deterministic per-proc counter for generated
+	// global/proc names; a proc body is codegen'd sequentially, so this is
+	// stable across runs (unlike a shared atomic counter).
+	u32 generated_name_guid;
 };
 
 
@@ -239,6 +244,19 @@ struct cgModule {
 	StringMap<cgValue>              members;
 	StringMap<cgProcedure *>        procedures;
 	PtrMap<TB_Function *, Entity *> procedure_values;
+
+	// NOTE(odin-tilde): deterministic build support. The checker assigns
+	// entity ids from a global atomic counter, so both id values and the
+	// order of info->entities depend on thread scheduling (they race even
+	// with -thread-count:1). These maps re-establish a deterministic order:
+	// entity_ranks   — index of the entity in the fully sorted entity array
+	//                  (used to sort codegen emission order)
+	// entity_ordinals — index of the entity within its (pkg, name) group,
+	//                  sorted by source position (used for the -N symbol
+	//                  suffix instead of the racy entity id)
+	PtrMap<Entity *, u64> entity_ranks;
+	PtrMap<Entity *, u64> entity_ordinals;
+	Array<Entity *>       entities_sorted;
 
 	RecursiveMutex debug_type_mutex;
 	PtrMap<Type *, TB_DebugType *> debug_type_map;
@@ -259,6 +277,13 @@ struct cgModule {
 	RecursiveMutex map_info_mutex;
 	PtrMap<Type *, TB_Symbol *> map_info_map;
 	PtrMap<Type *, TB_Symbol *> map_cell_info_map;
+
+	// NOTE(odin-tilde): structurally identical types from different
+	// instantiations are distinct Type* but share a type string, so
+	// type-keyed dedup alone produces same-named twin symbols whose layout
+	// order is not deterministic; dedup those by generated name as well.
+	StringMap<TB_Symbol *>   generated_globals_by_name; // mapci/mapi
+	StringMap<cgProcedure *> generated_procs_by_name;   // equal/hasher
 
 	// NOTE(bill): no need to protect this with a mutex
 	PtrMap<uintptr, TB_SourceFile *> file_id_map; // Key: AstFile.id (i32 cast to uintptr)

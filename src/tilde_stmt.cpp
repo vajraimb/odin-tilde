@@ -1049,7 +1049,8 @@ gb_internal cgAddr cg_add_global(cgProcedure *p, Type *type, Entity *e) {
 		alignment *= 2; // NOTE(bill): Just in case
 	}
 
-	TB_Global *global = tb_global_create(p->module->mod, 0, "", nullptr, TB_LINKAGE_PRIVATE);
+	String anon_name = cg_generated_name(p->module, p, "anon");
+	TB_Global *global = tb_global_create(p->module->mod, anon_name.len, cast(char const *)anon_name.text, nullptr, TB_LINKAGE_PRIVATE);
 	tb_global_set_storage(p->module->mod, tb_module_get_data(p->module->mod), global, size, alignment, 0);
 	TB_Node *local = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)global);
 
@@ -3107,7 +3108,13 @@ gb_internal void cg_build_mutable_value_decl(cgProcedure *p, Ast *node) {
 			{
 				gbString str = gb_string_make_length(permanent_allocator(), p->name.text, p->name.len);
 				str = gb_string_appendc(str, "-");
-				str = gb_string_append_fmt(str, ".%.*s-%llu", LIT(name), cast(long long)e->id);
+				str = gb_string_append_fmt(str, ".%.*s-", LIT(name));
+				// NOTE(odin-tilde): deterministic suffix (see
+				// cg_deterministic_suffix_into) instead of the racy
+				// checker-assigned entity id.
+				char suffix_buf[32] = {};
+				cg_deterministic_suffix_into(p->module, e, suffix_buf, gb_size_of(suffix_buf));
+				str = gb_string_appendc(str, suffix_buf);
 				mangled_name.text = cast(u8 *)str;
 				mangled_name.len = gb_string_length(str);
 			}

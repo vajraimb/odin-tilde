@@ -354,7 +354,17 @@ gb_internal TB_Symbol *cg_builtin_map_cell_info_symbol(cgModule *m, Type *type) 
 	i64 size = 0, len = 0;
 	map_cell_size_and_len(type, &size, &len);
 
-	TB_Global *global = tb_global_create(m->mod, 0, "", cg_debug_type(m, t_map_cell_info), TB_LINKAGE_PRIVATE);
+	String mci_name = cg_typed_generated_name("mapci", type);
+	// NOTE(odin-tilde): dedup structurally identical twins by name (see
+	// cgModule.generated_globals_by_name).
+	StringHashKey mci_key = string_hash_string(mci_name);
+	TB_Symbol **by_name = string_map_get(&m->generated_globals_by_name, mci_key);
+	if (by_name) {
+		map_set(&m->map_cell_info_map, type, *by_name);
+		return *by_name;
+	}
+	TB_Global *global = tb_global_create(m->mod, mci_name.len, cast(char const *)mci_name.text, cg_debug_type(m, t_map_cell_info), TB_LINKAGE_PRIVATE);
+	string_map_set(&m->generated_globals_by_name, mci_name, cast(TB_Symbol *)global);
 	tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), global, type_size_of(t_map_cell_info), type_align_of(t_map_cell_info), 4);
 
 	i64 ptr_size = build_context.ptr_size;
@@ -392,7 +402,17 @@ gb_internal cgValue cg_builtin_map_info(cgProcedure *p, Type *map_type) {
 	if (found) {
 		global = cast(TB_Global *)*found;
 	} else {
-		global = tb_global_create(m->mod, 0, "", cg_debug_type(m, t_map_info), TB_LINKAGE_PRIVATE);
+		String mi_name = cg_typed_generated_name("mapi", map_type);
+		StringHashKey mi_key = string_hash_string(mi_name);
+		TB_Symbol **by_name = string_map_get(&m->generated_globals_by_name, mi_key);
+		if (by_name) {
+			// NOTE(odin-tilde): structurally identical twin (see
+			// cgModule.generated_globals_by_name).
+			global = cast(TB_Global *)*by_name;
+			map_set(&m->map_info_map, map_type, *by_name);
+		} else {
+		global = tb_global_create(m->mod, mi_name.len, cast(char const *)mi_name.text, cg_debug_type(m, t_map_info), TB_LINKAGE_PRIVATE);
+		string_map_set(&m->generated_globals_by_name, mi_name, cast(TB_Symbol *)global);
 		tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), global, type_size_of(t_map_info), type_align_of(t_map_info), 4);
 
 		TB_Symbol *key_cell_info   = cg_builtin_map_cell_info_symbol(m, map_type->Map.key);
@@ -406,6 +426,7 @@ gb_internal cgValue cg_builtin_map_info(cgProcedure *p, Type *map_type) {
 		tb_global_add_symbol_reloc(p->module->mod, global, 3*build_context.ptr_size, key_equal->symbol);
 
 		map_set(&m->map_info_map, map_type, cast(TB_Symbol *)global);
+		}
 	}
 
 	GB_ASSERT(global != nullptr);

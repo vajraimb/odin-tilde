@@ -482,6 +482,148 @@ gb_internal void cg_add_foreign_library_path(cgModule *m, Entity *e) {
 	mutex_unlock(&ld->foreign_mutex);
 }
 
+// NOTE(odin-tilde): deterministic build support — see the comment on
+// entity_ranks/entity_ordinals in cgModule (tilde.hpp).
+gb_internal int cg_entity_deterministic_cmp(void const *a, void const *b) {
+	Entity *ea = *cast(Entity * const *)a;
+	Entity *eb = *cast(Entity * const *)b;
+
+	String pa = ea->pkg ? ea->pkg->name : String{};
+	String pb = eb->pkg ? eb->pkg->name : String{};
+	i32 c = string_compare(pa, pb);
+	if (c != 0) return c;
+	c = string_compare(ea->token.string, eb->token.string);
+	if (c != 0) return c;
+	// Within one (pkg, name) group the source position is NOT a stable key:
+	// polymorphic specializations record the token of whichever call site
+	// created them first, which is thread-scheduling dependent. The type
+	// string is structural and stable, so it leads the intra-group order.
+	if (ea->type != eb->type) {
+		gbString sa = type_to_string(ea->type);
+		gbString sb = type_to_string(eb->type);
+		String ta = make_string(cast(u8 const *)sa, gb_string_length(sa));
+		String tb = make_string(cast(u8 const *)sb, gb_string_length(sb));
+		c = string_compare(ta, tb);
+		if (c != 0) return c;
+	}
+	if (ea->token.pos.file_id != eb->token.pos.file_id) return ea->token.pos.file_id < eb->token.pos.file_id ? -1 : 1;
+	if (ea->token.pos.line   != eb->token.pos.line)   return ea->token.pos.line   < eb->token.pos.line   ? -1 : 1;
+	if (ea->token.pos.column != eb->token.pos.column) return ea->token.pos.column < eb->token.pos.column ? -1 : 1;
+	if (ea->kind != eb->kind) return ea->kind < eb->kind ? -1 : 1;
+	// Last-resort tiebreak for entities identical in every deterministic
+	// field (e.g. multiple `_` blanks). The racy id only orders entities
+	// that never receive symbols, so it cannot leak into the output.
+	if (ea->id != eb->id) return ea->id < eb->id ? -1 : 1;
+	return 0;
+}
+
+gb_internal void cg_build_deterministic_entity_order(cgModule *m) {
+	map_init(&m->entity_ranks);
+	map_init(&m->entity_ordinals);
+	m->entities_sorted = array_make<Entity *>(heap_allocator(), 0, m->info->entities.count);
+	for (Entity *e : m->info->entities) {
+		array_add(&m->entities_sorted, e);
+	}
+	gb_sort_array(m->entities_sorted.data, m->entities_sorted.count, cg_entity_deterministic_cmp);
+	u64 ordinal = 0;
+	for_array(i, m->entities_sorted) {
+		Entity *e = m->entities_sorted[i];
+		map_set(&m->entity_ranks, e, cast(u64)i);
+		if (i > 0) {
+			Entity *p = m->entities_sorted[i-1];
+			if (p->pkg == e->pkg && p->token.string == e->token.string) {
+				ordinal += 1;
+			} else {
+				ordinal = 0;
+			}
+		} else {
+			ordinal = 0;
+		}
+		map_set(&m->entity_ordinals, e, ordinal);
+	}
+}
+
+// NOTE(odin-tilde): one deterministic suffix source for all mangled names.
+// Entities registered in info->entities use their name-group ordinal;
+// entities that never enter that array (e.g. proc-local statics, which only
+// live in their declaration scope) fall back to their declaration position
+// (stable for such entities), formatted with 'x' so it can never collide
+// numerically with an ordinal. The racy entity id is the last resort for
+// positionless generated entities.
+gb_internal isize cg_deterministic_suffix_into(cgModule *m, Entity *e, char *buf, isize buf_len) {
+	u64 *ord = m ? map_get(&m->entity_ordinals, e) : nullptr;
+	if (ord != nullptr) {
+		return gb_snprintf(buf, buf_len, "%llu", cast(unsigned long long)*ord);
+	}
+	if (e->token.pos.file_id != 0) {
+		return gb_snprintf(buf, buf_len, "%ux%u", cast(u32)e->token.pos.line, cast(u32)e->token.pos.column);
+	}
+	return gb_snprintf(buf, buf_len, "%llu", cast(unsigned long long)e->id);
+}
+
+// NOTE(odin-tilde): deterministic names for generated globals/procs.
+// Proc-context creations are numbered with a per-proc counter and embed the
+// (unique, stable) proc link name, so the result does not depend on worker
+// interleaving; module-level creations fall back to a module counter and are
+// only used from sequential phases (global-data and type-info emission).
+gb_internal String cg_generated_name(cgModule *m, cgProcedure *p, char const *prefix) {
+	isize prefix_len = gb_strlen(prefix);
+	isize cap = prefix_len + 32;
+	if (p != nullptr) {
+		cap += p->name.len;
+	}
+	char *buf = gb_alloc_array(permanent_allocator(), char, cap);
+	isize n;
+	if (p != nullptr) {
+		n = gb_snprintf(buf, cap, "%s$%.*s$%u", prefix, LIT(p->name), 1+p->generated_name_guid++);
+	} else {
+		n = gb_snprintf(buf, cap, "%s$m$%u", prefix, 1+m->const_nil_guid.fetch_add(1));
+	}
+	return make_string(cast(u8 *)buf, n-1);
+}
+
+// NOTE(odin-tilde): deterministic name for type-keyed generated symbols
+// (equal/hasher procs, map info globals). The creation sites dedup through a
+// PtrMap<Type*, ...>, so a hash of the type string is stable and unique in
+// practice; a collision would surface as a TB symbol-collision panic.
+gb_internal String cg_typed_generated_name(char const *prefix, Type *type) {
+	gbString ts = type_to_string(type);
+	u64 h = gb_murmur64(ts, gb_string_length(ts));
+	gb_string_free(ts);
+	char buf[64] = {};
+	isize n = gb_snprintf(buf, 63, "%s$%llx", prefix, cast(unsigned long long)h);
+	return make_string(cast(u8 *)gb_alloc_str_len(permanent_allocator(), buf, n-1), n-1);
+}
+
+// NOTE(odin-tilde): the checker sorts @(init)/@(fini) procs primarily by
+// pkg->order, which depends on package load order and is not stable across
+// builds; re-sort with a fully deterministic key (pkg name, file path,
+// source order, offset) before emitting startup/cleanup calls.
+gb_internal GB_COMPARE_PROC(cg_init_fini_cmp) {
+	Entity *x = *cast(Entity **)a;
+	Entity *y = *cast(Entity **)b;
+	if (x == y) {
+		return 0;
+	}
+	String px = x->pkg ? x->pkg->name : (String{});
+	String py = y->pkg ? y->pkg->name : (String{});
+	int cmp = string_compare(px, py);
+	if (cmp) {
+		return cmp;
+	}
+	String fx = x->file ? x->file->fullpath : (String{});
+	String fy = y->file ? y->file->fullpath : (String{});
+	cmp = string_compare(fx, fy);
+	if (cmp) {
+		return cmp;
+	}
+	cmp = u64_cmp(x->order_in_src, y->order_in_src);
+	if (cmp) {
+		return cmp;
+	}
+	return i32_cmp(x->token.pos.offset, y->token.pos.offset);
+}
+
 gb_internal cgModule *cg_module_create(Checker *c) {
 	cgModule *m = gb_alloc_item(permanent_allocator(), cgModule);
 
@@ -508,6 +650,8 @@ gb_internal cgModule *cg_module_create(Checker *c) {
 	map_init(&m->map_set_procs);
 	map_init(&m->map_info_map);
 	map_init(&m->map_cell_info_map);
+	string_map_init(&m->generated_globals_by_name);
+	string_map_init(&m->generated_procs_by_name);
 
 	array_init(&m->single_threaded_procedure_queue, heap_allocator());
 
@@ -537,6 +681,8 @@ gb_internal void cg_module_destroy(cgModule *m) {
 	map_destroy(&m->map_set_procs);
 	map_destroy(&m->map_info_map);
 	map_destroy(&m->map_cell_info_map);
+	string_map_destroy(&m->generated_globals_by_name);
+	string_map_destroy(&m->generated_procs_by_name);
 
 	array_free(&m->single_threaded_procedure_queue);
 
@@ -622,7 +768,7 @@ gb_internal String cg_mangle_name(cgModule *m, Entity *e) {
 	}
 
 	if (require_suffix_id) {
-		max_len += 21;
+		max_len += 24;
 	}
 
 	char *new_name = gb_alloc_array(permanent_allocator(), char, max_len);
@@ -633,7 +779,10 @@ gb_internal String cg_mangle_name(cgModule *m, Entity *e) {
 	if (require_suffix_id) {
 		char *str = new_name + new_name_len-1;
 		isize len = max_len-new_name_len;
-		isize extra = gb_snprintf(str, len, "-%llu", cast(unsigned long long)e->id);
+		// NOTE(odin-tilde): deterministic suffix (name-group ordinal /
+		// declaration position) instead of the racy checker-assigned id.
+		isize extra = 1 + cg_deterministic_suffix_into(m, e, str+1, len-1);
+		str[0] = '-';
 		new_name_len += extra-1;
 	}
 
@@ -818,6 +967,10 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 
 	m->do_threading = false;
 
+	// NOTE(odin-tilde): establish the deterministic entity order before any
+	// naming or emission happens (see entity_ranks/entity_ordinals).
+	cg_build_deterministic_entity_order(m);
+
 	TIME_SECTION("Tilde Global Variables");
 
 	Array<cgGlobalVariable> global_variables = {};
@@ -843,7 +996,7 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 	array_init(&procedures_to_generate, heap_allocator());
 	defer (array_free(&procedures_to_generate));
 
-	for (Entity *e : info->entities) {
+	for (Entity *e : m->entities_sorted) {
 		String name  = e->token.string;
 		Scope *scope = e->scope;
 
@@ -888,7 +1041,13 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 		cg_global_variables_initialize(p, &global_variables);
 		// NOTE(odin-tilde): run @(init) procedures (os.init_std_files and
 		// friends) exactly like the LLVM backend's startup runtime does.
+		// Re-sorted for build determinism (see cg_init_fini_cmp).
+		Array<Entity *> sorted_inits = array_make<Entity *>(temporary_allocator(), 0, info->init_procedures.count);
 		for (Entity *e : info->init_procedures) {
+			array_add(&sorted_inits, e);
+		}
+		array_sort(sorted_inits, cg_init_fini_cmp);
+		for (Entity *e : sorted_inits) {
 			cgValue value = cg_find_procedure_value_from_entity(m, e);
 			cg_emit_call(p, value, {});
 		}
@@ -899,8 +1058,15 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 		cgProcedure *p = cg_cleanup_runtime_proc;
 		TB_GraphBuilder *g = tb_builder_enter(p->func, tb_module_get_text(p->module->mod), p->proto, nullptr);
 		cg_tb_push_builder(p->func, g);
-		// NOTE(odin-tilde): run @(fini) procedures like the LLVM backend.
+		// NOTE(odin-tilde): run @(fini) procedures like the LLVM backend
+		// (reverse of init order), sorted for build determinism.
+		Array<Entity *> sorted_finis = array_make<Entity *>(temporary_allocator(), 0, info->fini_procedures.count);
 		for (Entity *e : info->fini_procedures) {
+			array_add(&sorted_finis, e);
+		}
+		array_sort(sorted_finis, cg_init_fini_cmp);
+		for (isize i = sorted_finis.count-1; i >= 0; i--) {
+			Entity *e = sorted_finis[i];
 			cgValue value = cg_find_procedure_value_from_entity(m, e);
 			cg_emit_call(p, value, {});
 		}

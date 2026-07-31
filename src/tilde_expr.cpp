@@ -129,9 +129,8 @@ gb_internal cgAddr cg_build_addr_from_entity(cgProcedure *p, Entity *e, Ast *exp
 		// directly from the ExactValue since scalar TB nodes cannot be
 		// global initializers).
 		cgModule *m = p->module;
-		char name[32] = {};
-		gb_snprintf(name, 31, "ggv$%u", 1+m->const_nil_guid.fetch_add(1));
-		TB_Global *g = tb_global_create(m->mod, -1, name, cg_debug_type(m, t), TB_LINKAGE_PRIVATE);
+		String name = cg_generated_name(m, p, "ggv");
+		TB_Global *g = tb_global_create(m->mod, name.len, cast(char const *)name.text, cg_debug_type(m, t), TB_LINKAGE_PRIVATE);
 		i64 max_objects = cg_global_const_calculate_region_count(e->Constant.value, t);
 		tb_global_set_storage(m->mod, tb_module_get_data(m->mod), g, type_size_of(t), type_align_of(t), max_objects);
 		cg_global_const_add_region(m, e->Constant.value, t, g, 0);
@@ -3913,7 +3912,11 @@ cgAddr cg_build_addr_compound_lit(cgProcedure *p, Ast *expr) {
 
 		TB_Node *backing = nullptr;
 		if (p->is_startup) {
-			TB_Global *global = tb_global_create(p->module->mod, 0, "", nullptr, TB_LINKAGE_PRIVATE);
+			TB_Global *global = nullptr;
+			{
+				String gen_name = cg_generated_name(p->module, p, "sldata");
+				global = tb_global_create(p->module->mod, gen_name.len, cast(char const *)gen_name.text, nullptr, TB_LINKAGE_PRIVATE);
+			}
 			tb_global_set_storage(p->module->mod, tb_module_get_data(p->module->mod), global, backing_size, align, 0);
 			backing = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)global);
 		} else {

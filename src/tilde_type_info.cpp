@@ -286,6 +286,21 @@ gb_internal void cg_set_type_info_member_enum_values(cgModule *m, TB_Global *glo
 
 
 
+// NOTE(odin-tilde): entry for deterministic type-info emission (see
+// cg_setup_type_info_data): hash-map iteration order is not stable, but the
+// emission loop creates named globals whose module-counter suffixes depend
+// on creation order, so entries are emitted in entry-index order instead.
+struct cgTypeInfoEmitEntry {
+	isize index;
+	Type *t;
+};
+
+gb_internal int cg_type_info_emit_entry_cmp(void const *a, void const *b) {
+	cgTypeInfoEmitEntry const *ea = cast(cgTypeInfoEmitEntry const *)a;
+	cgTypeInfoEmitEntry const *eb = cast(cgTypeInfoEmitEntry const *)b;
+	return (ea->index > eb->index) - (ea->index < eb->index);
+}
+
 gb_internal void cg_setup_type_info_data(cgModule *m) {
 	if (build_context.no_rtti) {
 		return;
@@ -451,21 +466,26 @@ gb_internal void cg_setup_type_info_data(cgModule *m) {
 	};
 
 
+	// NOTE(odin-tilde): see cgTypeInfoEmitEntry — emit in entry-index order
+	// so that generated global names are stable across runs.
+	Array<cgTypeInfoEmitEntry> emit_entries = array_make<cgTypeInfoEmitEntry>(temporary_allocator(), 0, info->type_info_types_hash_map.count);
 	for (auto const &tt : info->type_info_types_hash_map) {
 		Type *t = tt.type;
 		if (t == nullptr || t == t_invalid) {
 			continue;
 		}
-
 		isize entry_index = cg_type_info_index(info, t, false);
-		if (entry_index <= 0) {
-			continue;
-		}
-
-		if (entries_handled[entry_index]) {
+		if (entry_index <= 0 || entries_handled[entry_index]) {
 			continue;
 		}
 		entries_handled[entry_index] = true;
+		array_add(&emit_entries, cgTypeInfoEmitEntry{entry_index, t});
+	}
+	gb_sort_array(emit_entries.data, emit_entries.count, cg_type_info_emit_entry_cmp);
+
+	for (auto const &entry : emit_entries) {
+		Type *t = entry.t;
+		isize entry_index = entry.index;
 
 		TB_Global *global = type_table_array;
 
@@ -527,8 +547,10 @@ gb_internal void cg_setup_type_info_data(cgModule *m) {
 			// its own global and store a pointer to it here
 			i64 loc_offset = type_offset_of(tag_type, 3);
 			TokenPos pos = t->Named.type_name->token.pos;
-			char scl_name[32] = {};
-			gb_snprintf(scl_name, 31, "scl$%u", 1+m->const_nil_guid.fetch_add(1));
+			// NOTE(odin-tilde): deterministic, position-keyed name — the
+			// declaration position of a named type is unique and stable.
+			char scl_name[48] = {};
+			gb_snprintf(scl_name, 47, "scl$ti$%ux%ux%u", cast(u32)pos.file_id, cast(u32)pos.line, cast(u32)pos.column);
 			TB_Global *scl_global = tb_global_create(m->mod, -1, scl_name, cg_debug_type(m, t_source_code_location), TB_LINKAGE_PRIVATE);
 			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), scl_global, type_size_of(t_source_code_location), type_align_of(t_source_code_location), 12);
 			cg_global_source_code_location_const(m, proc_name, pos, scl_global, 0);

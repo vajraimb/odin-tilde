@@ -233,17 +233,7 @@ gb_internal cgProcedure *cg_procedure_generate_anonymous(cgModule *m, Ast *expr,
 	// NOTE(bill): Generate a new name
 	// parent$count
 
-	String prefix_name = str_lit("proc_lit");
-	if (parent) {
-		prefix_name = parent->name;
-	}
-
-	isize name_len = prefix_name.len + 6 + 11;
-	char *name_text = gb_alloc_array(permanent_allocator(), char, name_len);
-
-	static std::atomic<i32> name_id;
-	name_len = gb_snprintf(name_text, name_len, "%.*s$anon-%d", LIT(prefix_name), 1+name_id.fetch_add(1));
-	String name = make_string((u8 *)name_text, name_len-1);
+	String name = cg_generated_name(m, parent, "anon");
 
 	Type *type = type_of_expr(expr);
 
@@ -1361,15 +1351,17 @@ gb_internal cgProcedure *cg_equal_proc_for_type(cgModule *m, Type *type) {
 		return *found;
 	}
 
-	static std::atomic<u32> proc_index;
+	String proc_name = cg_typed_generated_name("__$equal", type);
 
-	char buf[32] = {};
-	isize n = gb_snprintf(buf, 32, "__$equal%u", 1+proc_index.fetch_add(1));
-	char *str = gb_alloc_str_len(permanent_allocator(), buf, n-1);
-	String proc_name = make_string_c(str);
-
+	// NOTE(odin-tilde): dedup structurally identical twins by name (see
+	// cgModule.generated_procs_by_name).
+	if (cgProcedure **by_name = string_map_get(&m->generated_procs_by_name, string_hash_string(proc_name))) {
+		map_set(&m->equal_procs, type, *by_name);
+		return *by_name;
+	}
 
 	cgProcedure *p = cg_procedure_create_dummy(m, proc_name, t_equal_proc);
+	string_map_set(&m->generated_procs_by_name, proc_name, p);
 	map_set(&m->equal_procs, type, p);
 	p->split_returns_index = 2;
 
@@ -1536,15 +1528,17 @@ gb_internal cgProcedure *cg_hasher_proc_for_type(cgModule *m, Type *type) {
 		return *found;
 	}
 
-	static std::atomic<u32> proc_index;
+	String proc_name = cg_typed_generated_name("__$hasher", type);
 
-	char buf[32] = {};
-	isize n = gb_snprintf(buf, 32, "__$hasher%u", 1+proc_index.fetch_add(1));
-	char *str = gb_alloc_str_len(permanent_allocator(), buf, n-1);
-	String proc_name = make_string_c(str);
-
+	// NOTE(odin-tilde): dedup structurally identical twins by name (see
+	// cgModule.generated_procs_by_name).
+	if (cgProcedure **by_name = string_map_get(&m->generated_procs_by_name, string_hash_string(proc_name))) {
+		map_set(&m->hasher_procs, type, *by_name);
+		return *by_name;
+	}
 
 	cgProcedure *p = cg_procedure_create_dummy(m, proc_name, t_hasher_proc);
+	string_map_set(&m->generated_procs_by_name, proc_name, p);
 	map_set(&m->hasher_procs, type, p);
 	p->split_returns_index = 2;
 

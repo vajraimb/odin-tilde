@@ -15,9 +15,8 @@ gb_internal cgValue cg_const_nil(cgModule *m, cgProcedure *p, Type *type) {
 	i64 align = type_align_of(type);
 	TB_DataType dt = cg_data_type(type);
 	if (TB_IS_VOID_TYPE(dt)) {
-		char name[32] = {};
-		gb_snprintf(name, 31, "cnil$%u", 1+m->const_nil_guid.fetch_add(1));
-		TB_Global *global = tb_global_create(m->mod, -1, name, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
+		String name = cg_generated_name(m, p, "cnil");
+		TB_Global *global = tb_global_create(m->mod, name.len, cast(char const *)name.text, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
 		tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), global, size, align, 0);
 
 		TB_Symbol *symbol = cast(TB_Symbol *)global;
@@ -84,10 +83,9 @@ gb_internal void cg_global_source_code_location_const(cgModule *m, String const 
 
 gb_internal cgValue cg_emit_source_code_location_as_global(cgProcedure *p, String const &proc_name, TokenPos pos) {
 	cgModule *m = p->module;
-	char name[32] = {};
-	gb_snprintf(name, 31, "scl$%u", 1+m->const_nil_guid.fetch_add(1));
+	String name = cg_generated_name(m, p, "scl");
 
-	TB_Global *global = tb_global_create(m->mod, -1, name, cg_debug_type(m, t_source_code_location), TB_LINKAGE_PRIVATE);
+	TB_Global *global = tb_global_create(m->mod, name.len, cast(char const *)name.text, cg_debug_type(m, t_source_code_location), TB_LINKAGE_PRIVATE);
 	tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), global, type_size_of(t_source_code_location), type_align_of(t_source_code_location), 6);
 
 	cg_global_source_code_location_const(m, proc_name, pos, global, 0);
@@ -172,9 +170,8 @@ gb_internal void cg_write_uint_at_ptr(void *dst, u64 i, Type *original_type) {
 gb_internal TB_Global *cg_global_const_string(cgModule *m, String const &str, Type *type, TB_Global *global, i64 offset) {
 	GB_ASSERT(is_type_string(type));
 
-	char name[32] = {};
-	gb_snprintf(name, 31, "csb$%u", 1+m->const_nil_guid.fetch_add(1));
-	TB_Global *str_global = tb_global_create(m->mod, -1, name, nullptr, TB_LINKAGE_PRIVATE);
+	String name = cg_generated_name(m, nullptr, "csb");
+	TB_Global *str_global = tb_global_create(m->mod, name.len, cast(char const *)name.text, nullptr, TB_LINKAGE_PRIVATE);
 	i64 size = str.len+1;
 	tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), str_global, size, 1, 1);
 	u8 *data = cast(u8 *)tb_global_add_region(m->mod, str_global, 0, size);
@@ -189,8 +186,8 @@ gb_internal TB_Global *cg_global_const_string(cgModule *m, String const &str, Ty
 	}
 
 	if (global == nullptr) {
-		gb_snprintf(name, 31, "cstr$%u", 1+m->const_nil_guid.fetch_add(1));
-		global = tb_global_create(m->mod, -1, name, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
+		String cstr_name = cg_generated_name(m, nullptr, "cstr");
+		global = tb_global_create(m->mod, cstr_name.len, cast(char const *)cstr_name.text, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
 		tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), global, type_size_of(type), type_align_of(type), 2);
 	}
 
@@ -721,9 +718,8 @@ gb_internal TB_Global *cg_global_const_comp_literal(cgModule *m, Type *original_
 	TEMPORARY_ALLOCATOR_GUARD();
 
 	if (global == nullptr) {
-		char name[32] = {};
-		gb_snprintf(name, 31, "complit$%u", 1+m->const_nil_guid.fetch_add(1));
-		global = tb_global_create(m->mod, -1, name, cg_debug_type(m, original_type), TB_LINKAGE_PRIVATE);
+		String name = cg_generated_name(m, nullptr, "complit");
+		global = tb_global_create(m->mod, name.len, cast(char const *)name.text, cg_debug_type(m, original_type), TB_LINKAGE_PRIVATE);
 		i64 size = type_size_of(original_type);
 		i64 align = type_align_of(original_type);
 
@@ -1032,9 +1028,8 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 			// cannot be a single TB node, so materialize it into rodata and
 			// hand back its address (same idiom as ExactValue_Compound).
 			cgModule *m = p->module;
-			char name[32] = {};
-			gb_snprintf(name, 31, "aggint$%u", 1+m->const_nil_guid.fetch_add(1));
-			TB_Global *g = tb_global_create(m->mod, -1, name, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
+			String name = cg_generated_name(m, p, "aggint");
+			TB_Global *g = tb_global_create(m->mod, name.len, cast(char const *)name.text, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
 			i64 size = type_size_of(type);
 			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), g, size, type_align_of(type), 1);
 			void *data = tb_global_add_region(m->mod, g, 0, size);
@@ -1084,9 +1079,8 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 
 			String str = value.value_string;
 
-			char name[32] = {};
-			gb_snprintf(name, 31, "csb$%u", 1+m->const_nil_guid.fetch_add(1));
-			TB_Global *cstr_global = tb_global_create(m->mod, -1, name, nullptr, TB_LINKAGE_PRIVATE);
+			String name = cg_generated_name(m, p, "csb");
+			TB_Global *cstr_global = tb_global_create(m->mod, name.len, cast(char const *)name.text, nullptr, TB_LINKAGE_PRIVATE);
 
 			i64 size = str.len+1;
 			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), cstr_global, size, 1, 1);
@@ -1099,8 +1093,8 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 				return cg_flatten_value(p, s);
 			}
 
-			gb_snprintf(name, 31, "str$%u", 1+m->const_nil_guid.fetch_add(1));
-			TB_Global *str_global = tb_global_create(m->mod, -1, name, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
+			String str_name = cg_generated_name(m, p, "str");
+			TB_Global *str_global = tb_global_create(m->mod, str_name.len, cast(char const *)str_name.text, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
 			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), str_global, type_size_of(type), type_align_of(type), 2);
 
 			tb_global_add_symbol_reloc(m->mod, str_global, 0, cast(TB_Symbol *)cstr_global);
@@ -1119,9 +1113,8 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 			// value into a rodata global and hand back its address (same
 			// idiom as ExactValue_Compound).
 			cgModule *m = p->module;
-			char name[32] = {};
-			gb_snprintf(name, 31, "cq$%u", 1+m->const_nil_guid.fetch_add(1));
-			TB_Global *g = tb_global_create(m->mod, -1, name, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
+			String name = cg_generated_name(m, p, "cq");
+			TB_Global *g = tb_global_create(m->mod, name.len, cast(char const *)name.text, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
 			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), g, type_size_of(type), type_align_of(type), 1);
 			cg_global_const_add_region(m, value, type, g, 0);
 			TB_Node *s = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)g);
