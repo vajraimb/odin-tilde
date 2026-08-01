@@ -1442,7 +1442,7 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 
 	Type *src = core_type(src_type);
 	Type *dst = core_type(t);
-	GB_ASSERT(src != nullptr);
+	GB_ASSERT_MSG(src != nullptr, "src_type=%s t=%s proc=%.*s", type_to_string(src_type), type_to_string(t), LIT(p->name));
 	GB_ASSERT(dst != nullptr);
 
 	if (are_types_identical(src, dst)) {
@@ -5106,6 +5106,17 @@ gb_internal cgAddr cg_build_addr_index_expr(cgProcedure *p, Ast *expr) {
 		cgValue v = cg_emit_ptr_offset(p, elem, index);
 		v.type = alloc_type_pointer(type_deref(v.type, true));
 		return cg_addr(v);
+	}
+
+	case Type_FixedCapacityDynamicArray: {
+		// NOTE(odin-tilde): the data buffer is inline at offset 0, so
+		// &a[i] == base + i*elem_size (mirror the Type_Array path's stride).
+		cgAddr base_addr = cg_build_addr(p, ie->expr);
+		cgValue base_ptr = cg_addr_get_ptr(p, base_addr);
+		cgValue index = cg_emit_conv(p, cg_build_expr(p, ie->index), t_int);
+		i64 stride = type_size_of(t->FixedCapacityDynamicArray.elem);
+		TB_Node *node = tb_inst_array_access(p->func, base_ptr.node, index.node, stride);
+		return cg_addr(cg_value(node, alloc_type_pointer(t->FixedCapacityDynamicArray.elem)));
 	}
 
 	case Type_Matrix: {

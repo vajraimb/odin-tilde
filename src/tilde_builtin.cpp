@@ -57,6 +57,13 @@ gb_internal cgValue cg_builtin_len(cgProcedure *p, cgValue value) {
 			cgValue len_ptr = cg_emit_struct_ep(p, ptr, 1);
 			return cg_emit_load(p, len_ptr);
 		}
+	case Type_FixedCapacityDynamicArray:
+		{
+			GB_ASSERT(value.kind == cgValue_Addr);
+			cgValue ptr = cg_value(value.node, alloc_type_pointer(value.type));
+			cgValue len_ptr = cg_emit_struct_ep(p, ptr, 1);
+			return cg_emit_load(p, len_ptr);
+		}
 	case Type_Map:
 		{
 			GB_ASSERT(value.kind == cgValue_Addr);
@@ -129,6 +136,8 @@ gb_internal cgValue cg_builtin_cap(cgProcedure *p, cgValue value) {
 			cgValue len_ptr = cg_emit_struct_ep(p, ptr, 2);
 			return cg_emit_load(p, len_ptr);
 		}
+	case Type_FixedCapacityDynamicArray:
+		return cg_const_int(p, t_int, t->FixedCapacityDynamicArray.capacity);
 	case Type_Map:
 		{
 			TB_DataType dt_uintptr = cg_data_type(t_uintptr);

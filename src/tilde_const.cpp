@@ -481,6 +481,17 @@ gb_internal isize cg_global_const_calculate_region_count(ExactValue const &value
 		case Type_Slice:
 			return 3;
 
+		case Type_Union: {
+			// NOTE(odin-tilde): payload regions (counted with the variant's
+			// own type) + one tag region.
+			Type *vt = type_of_expr(value.value_compound);
+			if (!union_is_variant_of(bt, vt)) {
+				// nil union constant — everything stays zero
+				return 0;
+			}
+			return cg_global_const_calculate_region_count(value, vt)+1;
+		}
+
 		default:
 			GB_PANIC("TODO(bill): %s", type_to_string(type));
 			break;
@@ -514,6 +525,24 @@ gb_internal TB_Symbol *cg_global_const_procedure_symbol(cgModule *m, ExactValue 
 		}
 		value = e->Constant.value;
 		GB_ASSERT(value.kind == ExactValue_Procedure);
+	}
+}
+
+// NOTE(odin-tilde): write a union's tag for a constant value whose payload
+// has variant type `vt` (tag value via union_variant_index_checked matches
+// cg_const_union_tag; layout: tag sits at Union.variant_block_size).
+gb_internal void cg_global_const_write_union_tag(cgModule *m, Type *ut, Type *vt, TB_Global *global, i64 offset) {
+	GB_ASSERT(ut->kind == Type_Union);
+	i64 tag_index = union_variant_index_checked(ut, vt);
+	Type *tag_type = union_tag_type(ut);
+	i64 tag_offset = ut->Union.variant_block_size;
+	void *dst = tb_global_add_region(m->mod, global, offset+tag_offset, type_size_of(tag_type));
+	switch (type_size_of(tag_type)) {
+	case 1: *(u8  *)dst = cast(u8 )tag_index; break;
+	case 2: *(u16 *)dst = cast(u16)tag_index; break;
+	case 4: *(u32 *)dst = cast(u32)tag_index; break;
+	case 8: *(u64 *)dst = cast(u64)tag_index; break;
+	default: GB_PANIC("union tag size"); break;
 	}
 }
 
@@ -767,7 +796,20 @@ gb_internal TB_Global *cg_global_const_comp_literal(cgModule *m, Type *original_
 		}
 
 		if (cl->elems.count == 0) {
-			tb_global_set_storage(m->mod, section, global, size, align, 0);
+			// NOTE(odin-tilde): an empty compound literal for a union still
+			// needs its tag written (the zeroed payload is already correct).
+			Type *ut = base_type(original_type);
+			isize rc = 0;
+			if (ut->kind == Type_Union) {
+				rc = cg_global_const_calculate_region_count(value, original_type);
+			}
+			tb_global_set_storage(m->mod, section, global, size, align, rc);
+			if (ut->kind == Type_Union) {
+				Type *vt = type_of_expr(value_compound);
+				if (union_is_variant_of(ut, vt)) {
+					cg_global_const_write_union_tag(m, ut, vt, global, base_offset);
+				}
+			}
 			return global;
 		}
 
@@ -777,6 +819,15 @@ gb_internal TB_Global *cg_global_const_comp_literal(cgModule *m, Type *original_
 	}
 
 	if (cl->elems.count == 0) {
+		// NOTE(odin-tilde): an empty compound literal for a union still needs
+		// its tag written (the zeroed payload is already correct).
+		Type *ut = base_type(original_type);
+		if (ut->kind == Type_Union) {
+			Type *vt = type_of_expr(value_compound);
+			if (union_is_variant_of(ut, vt)) {
+				cg_global_const_write_union_tag(m, ut, vt, global, base_offset);
+			}
+		}
 		return global;
 	}
 
@@ -923,6 +974,22 @@ gb_internal TB_Global *cg_global_const_comp_literal(cgModule *m, Type *original_
 			cg_write_int_at_ptr(len_ptr, count, t_int);
 		}
 		return global;
+
+	case Type_Union:
+		{
+			// NOTE(odin-tilde): a union constant carries a value of one of
+			// its variant types (mirror lb_const_value's union handling):
+			// write the payload at offset 0, then the tag after the variant
+			// block.
+			Type *vt = type_of_expr(value_compound);
+			if (union_is_variant_of(bt, vt)) {
+				TB_Global *out = cg_global_const_comp_literal(m, vt, value, global, base_offset);
+				GB_ASSERT(out == global);
+				cg_global_const_write_union_tag(m, bt, vt, global, base_offset);
+			}
+			// else: nil union constant — payload and tag stay zero.
+		}
+		return global;
 	}
 
 	GB_PANIC("TODO(bill): constant compound literal for %s", type_to_string(original_type));
@@ -1025,7 +1092,10 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 				if (expr->kind == Ast_ProcLit) {
 					cgProcedure *anon = cg_procedure_generate_anonymous(p->module, expr, p);
 					TB_Node *ptr = tb_inst_get_symbol_address(p->func, anon->symbol);
-					GB_ASSERT(are_types_identical(type, anon->type));
+					// NOTE(odin-tilde): the target type may be a named/distinct
+					// alias of the proc type (e.g. http.Handler); the node is
+					// an untyped symbol address either way.
+					GB_ASSERT(is_type_proc(type) && is_type_proc(anon->type));
 					return cg_value(ptr, type);
 				}
 
@@ -1038,7 +1108,7 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 					GB_ASSERT_MSG(found != nullptr, "could not find '%.*s'", LIT(e->token.string));
 					TB_Node *ptr = tb_inst_get_symbol_address(p->func, found);
 					GB_ASSERT(type != nullptr);
-					GB_ASSERT(are_types_identical(type, e->type));
+					GB_ASSERT(is_type_proc(type) && is_type_proc(e->type));
 					return cg_value(ptr, type);
 				}
 				proc_value = e->Constant.value;

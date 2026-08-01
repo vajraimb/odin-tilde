@@ -823,6 +823,18 @@ gb_internal cgValue cg_emit_struct_ep(cgProcedure *p, cgValue s, i64 index) {
 			}
 			break;
 		}
+	case Type_FixedCapacityDynamicArray:
+		// {data: [capacity]elem, len: int} — offsets from type_offset_of
+		if (index == 0) {
+			result_type = alloc_type_array(t->FixedCapacityDynamicArray.elem, t->FixedCapacityDynamicArray.capacity);
+			offset = 0;
+		} else if (index == 1) {
+			result_type = t_int;
+			offset = type_offset_of(t, 1, nullptr);
+		} else {
+			goto error_case;
+		}
+		break;
 	case Type_Array:
 		return cg_emit_array_epi(p, s, index);
 	case Type_SoaPointer:
@@ -1948,6 +1960,16 @@ gb_internal void cg_build_range_stmt_indexed(cgProcedure *p, cgValue expr, Type 
 		}
 		break;
 	}
+	case Type_FixedCapacityDynamicArray: {
+		if (val_type != nullptr) {
+			// NOTE(odin-tilde): inline buffer at offset 0 — index the base
+			// pointer directly with the element stride.
+			i64 stride = type_size_of(expr_type->FixedCapacityDynamicArray.elem);
+			TB_Node *node = tb_inst_array_access(p->func, expr.node, idx.node, stride);
+			val = cg_emit_load(p, cg_value(node, alloc_type_pointer(expr_type->FixedCapacityDynamicArray.elem)));
+		}
+		break;
+	}
 	case Type_Struct: {
 		GB_ASSERT(is_type_soa_struct(expr_type));
 		break;
@@ -2434,6 +2456,16 @@ gb_internal void cg_build_range_stmt(cgProcedure *p, Ast *node) {
 			break;
 		}
 		case Type_DynamicArray: {
+			cgValue count_ptr = {};
+			cgValue array = cg_build_addr_ptr(p, expr);
+			if (is_type_pointer(type_deref(array.type))) {
+				array = cg_emit_load(p, array);
+			}
+			count_ptr = cg_emit_struct_ep(p, array, 1);
+			cg_build_range_stmt_indexed(p, array, val0_type, count_ptr, &val, &key, &loop, &done, rs->reverse);
+			break;
+		}
+		case Type_FixedCapacityDynamicArray: {
 			cgValue count_ptr = {};
 			cgValue array = cg_build_addr_ptr(p, expr);
 			if (is_type_pointer(type_deref(array.type))) {

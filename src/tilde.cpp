@@ -236,6 +236,12 @@ gb_internal cgAddr cg_addr_swizzle(cgValue addr, Type *type, u8 swizzle_count, u
 
 
 gb_internal void cg_set_debug_pos_from_node(cgProcedure *p, Ast *node) {
+	// NOTE(odin-tilde): debug info export is not wired up (we always export
+	// TB_DEBUGFMT_NONE), so TB_DEBUG_LOCATION nodes are pure overhead — and
+	// worse, a location node landing as a block end crashes Cuik's late CFG
+	// computation (cfg.h tb_todo, seen compiling net@_set_option). Skip
+	// emission entirely until debug export exists.
+#if 0
 	if (node) {
 		TokenPos pos = ast_token(node).pos;
 		// PATCH(odin-tilde): synthesized AST nodes (e.g. inside generated
@@ -249,6 +255,7 @@ gb_internal void cg_set_debug_pos_from_node(cgProcedure *p, Ast *node) {
 			tb_inst_location(p->func, *file, pos.line, pos.column);
 		}
 	}
+#endif
 }
 
 gb_internal void cg_add_symbol(cgModule *m, Entity *e, TB_Symbol *symbol) {
