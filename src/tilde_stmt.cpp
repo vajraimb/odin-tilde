@@ -2279,7 +2279,12 @@ gb_internal cgValue cg_map_cap(cgProcedure *p, cgValue value) {
 	cgValue mask = cg_const_int(p, t_uintptr, MAP_CACHE_LINE_SIZE-1);
 	cgValue data = cg_emit_struct_ev(p, value, 0);
 	cgValue log2_cap = cg_emit_arith(p, Token_And, data, mask, t_uintptr);
-	return cg_emit_arith(p, Token_Shl, one, log2_cap, t_uintptr);
+	cgValue cap = cg_emit_arith(p, Token_Shl, one, log2_cap, t_uintptr);
+	// NOTE(odin-tilde): mirror lb_map_cap — a nil map has data == 0, which
+	// would otherwise decode to capacity 1 (1 << 0) and make map iteration
+	// dereference the nil cells pointer (empty-map for-loop segfault).
+	cgValue cmp = cg_emit_comp(p, Token_CmpEq, data, zero);
+	return cg_emit_conv(p, cg_emit_select(p, cmp, zero, cap), t_int);
 }
 
 gb_internal cgValue cg_map_cell_index_static(cgProcedure *p, Type *type, cgValue cells_ptr, cgValue index) {
@@ -3181,6 +3186,11 @@ gb_internal void cg_build_mutable_value_decl(cgProcedure *p, Ast *node) {
 				          ast_value->tav.mode == Addressing_Invalid);
 
 				value = ast_value->tav.value;
+				if (e->Variable.thread_local_model != "" && ast_value->tav.mode == Addressing_Constant) {
+					// NOTE(odin-tilde): TLS shim tables are calloc-zeroed;
+					// only zero initializers are supported for now.
+					cg_check_thread_local_initializer(e, &value);
+				}
 				max_objects = cg_global_const_calculate_region_count(value, e->type);
 			}
 			tb_global_set_storage(m->mod, section, global, type_size_of(e->type), type_align_of(e->type), max_objects);

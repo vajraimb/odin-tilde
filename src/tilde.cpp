@@ -415,6 +415,16 @@ gb_internal bool cg_global_variables_create(cgModule *m, Array<cgGlobalVariable>
 
 		if (e->Variable.thread_local_model != "") {
 			section = tb_module_get_tls(m->mod);
+			// NOTE(odin-tilde): TLS shim tables are calloc-zeroed per thread;
+			// only zero initializers are semantically supported for now.
+			if (decl->init_expr != nullptr) {
+				TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
+				if (tav.mode == Addressing_Constant && tav.value.kind != ExactValue_Invalid) {
+					cg_check_thread_local_initializer(e, &tav.value);
+				} else if (!is_type_untyped_nil(tav.type)) {
+					cg_check_thread_local_initializer(e, nullptr);
+				}
+			}
 		}
 		if (e->Variable.link_section.len > 0) {
 			// TODO(bill): custom module sections

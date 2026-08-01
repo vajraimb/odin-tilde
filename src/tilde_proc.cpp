@@ -755,7 +755,20 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 
 	TB_FunctionPrototype *proto = cg_procedure_type_as_prototype(p->module, type);
 	TB_Node *target = value.node;
-	auto params = slice_make<TB_Node *>(temporary_allocator(), proto->param_count);
+
+	// NOTE(odin-tilde): for c_vararg calls the individual vararg values are
+	// appended after the fixed parameters, so the call can carry MORE params
+	// than the prototype's formal count (which reserves exactly one slot for
+	// the variadic entity). Size the param buffer for the actual arg count.
+	isize params_capacity = proto->param_count;
+	if (pt->c_vararg && pt->variadic) {
+		isize fixed_count = 0;
+		if (pt->params) for (Entity *e : pt->params->Tuple.variables) {
+			if (e->kind == Entity_Variable) fixed_count += 1;
+		}
+		params_capacity += args.count - fixed_count;
+	}
+	auto params = slice_make<TB_Node *>(temporary_allocator(), params_capacity);
 
 
 	// NOTE(new-tb): works for both Win64 and SystemV; TB classifies passing
@@ -800,18 +813,41 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 			param_entity = param_entities[param_entity_index++];
 		} while (param_entity->kind != Entity_Variable);
 		Type *param_type = param_entity->type;
+		bool is_c_vararg_arg = false;
 		if (pt->c_vararg && pt->variadic && param_entity_index-1 == pt->variadic_index) {
 			// NOTE(odin-tilde): c varargs — the individual vararg values are
-			// appended after the fixed parameters, so conv to the slice's
-			// element type and keep consuming the variadic entity for all
-			// remaining args (otherwise a single value gets conv'd to the
-			// slice type itself, e.g. os._open's mode argument).
+			// appended after the fixed parameters, so keep consuming the
+			// variadic entity for all remaining args.
 			GB_ASSERT(param_type->kind == Type_Slice);
-			param_type = param_type->Slice.elem;
 			param_entity_index--;
+			is_c_vararg_arg = true;
 		}
 		cgValue arg = args[i];
-		arg = cg_emit_conv(p, arg, param_type);
+		if (is_c_vararg_arg) {
+			// NOTE(odin-tilde): mirror lb_emit_c_vararg — do NOT conv the
+			// value to the variadic slice's element type. Converting an int
+			// to `any` would box it into a 16-byte aggregate that travels
+			// INDIRECT (as a pointer), so the callee (e.g. posix.fcntl)
+			// reads a pointer value instead of the int. Each vararg keeps
+			// its own (defaulted) type with the C default argument
+			// promotions applied (f16/f32 -> f64, small ints/bools -> i32,
+			// bit_set -> its backing integer).
+			Type *elem_type = param_type->Slice.elem;
+			Type *t = arg.type;
+			if (!is_type_any(elem_type)) {
+				t = elem_type;
+				arg = cg_emit_conv(p, arg, t);
+			}
+			Type *core = core_type(t);
+			if (core->kind == Type_BitSet) {
+				core = core_type(bit_set_to_int(core));
+				arg = cg_emit_transmute(p, arg, core);
+			}
+			param_type = c_vararg_promote_type(core);
+			arg = cg_emit_conv(p, arg, param_type);
+		} else {
+			arg = cg_emit_conv(p, arg, param_type);
+		}
 		arg = cg_flatten_value(p, arg);
 
 		TB_Node *param = nullptr;
@@ -1155,6 +1191,11 @@ gb_internal cgValue cg_build_call_expr_internal(cgProcedure *p, Ast *expr) {
 					for (Ast *var_arg : variadic) {
 						cgValue arg = cg_build_expr(p, var_arg);
 						if (is_type_any(elem_type)) {
+							// NOTE(odin-tilde): mirror lb — untyped nil varargs
+							// become nil rawptr, not a conv to untyped nil.
+							if (is_type_untyped_nil(arg.type)) {
+								arg = cg_const_nil(p, t_rawptr);
+							}
 							array_add(&args, cg_emit_conv(p, arg, default_type(arg.type)));
 						} else {
 							array_add(&args, cg_emit_conv(p, arg, elem_type));

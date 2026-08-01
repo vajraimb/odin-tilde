@@ -294,6 +294,15 @@ struct cgModule {
 	// NOTE(odin-tilde): dummy global used as the target of LOCKed RMWs to
 	// implement atomic fences (TB has no fence node).
 	TB_Global *fence_dummy;
+
+	// NOTE(odin-tilde): Cuik has no Mach-O TLV support, so @(thread_local)
+	// variables are lowered to offsets into a per-thread table fetched via
+	// pthread key (runtime __tilde_tls_base). Offsets are assigned lazily on
+	// first materialization; the table has a fixed compile-time size
+	// (CG_TLS_TABLE_SIZE) so late assignment cannot outgrow it.
+	BlockingMutex           tls_mutex;
+	PtrMap<Entity *, i64>   tls_offsets;
+	i64                     tls_size = 0;
 };
 
 #ifndef ABI_PKG_NAME_SEPARATOR
@@ -438,6 +447,17 @@ gb_internal cgProcedure *cg_equal_proc_for_type (cgModule *m, Type *type);
 gb_internal cgProcedure *cg_hasher_proc_for_type(cgModule *m, Type *type);
 gb_internal cgValue     cg_hasher_proc_value_for_type(cgProcedure *p, Type *type);
 gb_internal cgValue     cg_equal_proc_value_for_type(cgProcedure *p, Type *type);
+
+// NOTE(odin-tilde): pthread-key TLS shim (Cuik lacks Mach-O TLV). Fixed-size
+// per-thread table; offsets are assigned lazily per TLS entity.
+#define CG_TLS_TABLE_SIZE (1 << 20)
+gb_internal bool    cg_entity_is_thread_local(Entity *e);
+gb_internal i64     cg_tls_offset_for(cgModule *m, Entity *e);
+gb_internal cgValue cg_tls_address(cgProcedure *p, Entity *e);
+gb_internal void    cg_tls_ensure_runtime_globals(cgModule *m);
+gb_internal bool    cg_exact_value_is_zero(ExactValue const &v);
+// constant_value == nullptr 表示存在运行时（非常量）初始化表达式
+gb_internal void    cg_check_thread_local_initializer(Entity *e, ExactValue const *constant_value);
 
 gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> const &args);
 gb_internal cgValue cg_emit_runtime_call(cgProcedure *p, char const *name, Slice<cgValue> const &args);

@@ -547,8 +547,11 @@ gb_internal void cg_global_const_write_union_tag(cgModule *m, Type *ut, Type *vt
 }
 
 gb_internal bool cg_global_const_add_region(cgModule *m, ExactValue const &value, Type *type, TB_Global *global, i64 offset) {
-	GB_ASSERT(is_type_endian_little(type));
-	GB_ASSERT(!is_type_different_to_arch_endianness(type));
+	// NOTE(odin-tilde): endian-different scalar types (u16be/u32be/...，如
+	// IP6_Address :: distinct [8]u16be 与 DNS 头结构) are supported — the
+	// scalar writers (cg_write_big_int_at_ptr, Float case below) byte-swap
+	// for non-native endianness. Host is always little-endian here.
+	GB_ASSERT(build_context.endian_kind == TargetEndian_Little);
 
 	GB_ASSERT(global != nullptr);
 
@@ -660,6 +663,14 @@ gb_internal bool cg_global_const_add_region(cgModule *m, ExactValue const &value
 			case 2: *(u16 *)res = f32_to_f16(cast(f32)f); break;
 			case 4: *(f32 *)res = cast(f32)f;             break;
 			case 8: *(f64 *)res = cast(f64)f;             break;
+			}
+			if (size > 1 && is_type_different_to_arch_endianness(type)) {
+				u8 *b = cast(u8 *)res;
+				for (i64 i = 0; i < size/2; i++) {
+					u8 tmp = b[i];
+					b[i] = b[size-1-i];
+					b[size-1-i] = tmp;
+				}
 			}
 		}
 		break;

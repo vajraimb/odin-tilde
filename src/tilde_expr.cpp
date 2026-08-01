@@ -119,6 +119,123 @@ gb_internal cgValue cg_get_using_variable(cgProcedure *p, Entity *e) {
 	// }
 	return ptr;
 }
+// NOTE(odin-tilde): pthread-key TLS shim. Cuik does not implement Mach-O TLV
+// access sequences (its TLS support is Windows-centric: x64 is_tls_symbol is
+// defined but never called, and there is no TLV relocation emission), so
+// @(thread_local) variables are lowered to offsets into a fixed-size
+// per-thread table fetched through a pthread key (runtime __tilde_tls_base,
+// base/runtime/tilde_tls_darwin.odin). The table is calloc-zeroed per thread;
+// non-zero initializers are rejected at compile time (see
+// cg_check_thread_local_initializer).
+
+gb_internal bool cg_entity_is_thread_local(Entity *e) {
+	return e != nullptr && e->kind == Entity_Variable && e->Variable.thread_local_model != "";
+}
+
+gb_internal i64 cg_tls_offset_for(cgModule *m, Entity *e) {
+	mutex_lock(&m->tls_mutex);
+	i64 *found = map_get(&m->tls_offsets, e);
+	if (found) {
+		mutex_unlock(&m->tls_mutex);
+		return *found;
+	}
+	i64 align = gb_max(type_align_of(e->type), 1);
+	i64 off = (m->tls_size + align - 1) & ~(align - 1);
+	m->tls_size = off + type_size_of(e->type);
+	GB_ASSERT_MSG(m->tls_size <= CG_TLS_TABLE_SIZE,
+		"tilde: @(thread_local) storage exceeds the %d-byte per-thread table", CG_TLS_TABLE_SIZE);
+	map_set(&m->tls_offsets, e, off);
+	mutex_unlock(&m->tls_mutex);
+	return off;
+}
+
+gb_internal cgValue cg_tls_address(cgProcedure *p, Entity *e) {
+	cg_tls_ensure_runtime_globals(p->module);
+	i64 offset = cg_tls_offset_for(p->module, e);
+	auto args = slice_make<cgValue>(temporary_allocator(), 1);
+	args[0] = cg_const_int(p, t_int, CG_TLS_TABLE_SIZE);
+	cgValue base = cg_emit_runtime_call(p, "__tilde_tls_base", args);
+	GB_ASSERT(base.node != nullptr);
+	TB_Node *node = base.node;
+	if (offset != 0) {
+		node = tb_inst_member_access(p->func, node, offset);
+	}
+	return cg_value(node, alloc_type_pointer(e->type));
+}
+
+// NOTE(odin-tilde): __tilde_tls_base's state globals (_tilde_tls_key/_state)
+// are referenced only by synthesized calls, so the checker's dependency graph
+// never marks them and cg_global_variables_create skips them. Create their TB
+// globals lazily on first TLS access.
+gb_internal void cg_tls_ensure_runtime_globals(cgModule *m) {
+	static char const *names[] = { "_tilde_tls_key", "_tilde_tls_state" };
+	AstPackage *pkg = m->info->runtime_package;
+	for (char const *name : names) {
+		u32 hash = 0;
+		InternedString interned = string_interner_insert(make_string_c(name), 0, &hash);
+		Entity *e = scope_lookup_current(pkg->scope, interned, hash);
+		if (e == nullptr) {
+			continue; // shim 文件未参与构建（非 darwin）
+		}
+		rw_mutex_shared_lock(&m->values_mutex);
+		bool exists = map_get(&m->values, e) != nullptr;
+		rw_mutex_shared_unlock(&m->values_mutex);
+		if (exists) {
+			continue;
+		}
+
+		mutex_lock(&m->tls_mutex);
+		rw_mutex_shared_lock(&m->values_mutex);
+		exists = map_get(&m->values, e) != nullptr;
+		rw_mutex_shared_unlock(&m->values_mutex);
+		if (!exists) {
+			String gname = cg_get_entity_name(m, e);
+			TB_DebugType *debug_type = cg_debug_type(m, e->type);
+			TB_Global *g = tb_global_create(m->mod, gname.len, cast(char const *)gname.text, debug_type, TB_LINKAGE_PRIVATE);
+			tb_global_set_storage(m->mod, tb_module_get_data(m->mod), g, type_size_of(e->type), type_align_of(e->type), 0);
+			cgValue gv = cg_value(g, alloc_type_pointer(e->type));
+			cg_add_symbol(m, e, cast(TB_Symbol *)g);
+			cg_add_entity(m, e, gv);
+			cg_add_member(m, gname, gv);
+		}
+		mutex_unlock(&m->tls_mutex);
+	}
+}
+
+gb_internal bool cg_exact_value_is_zero(ExactValue const &v) {
+	switch (v.kind) {
+	case ExactValue_Invalid:   return true;  // 无显式初始化
+	case ExactValue_Bool:      return !v.value_bool;
+	case ExactValue_Integer:   return big_int_is_zero(&v.value_integer);
+	case ExactValue_Float:     return v.value_float == 0;
+	case ExactValue_Pointer:   return v.value_pointer == 0;
+	case ExactValue_Typeid:    return v.value_typeid == nullptr;
+	case ExactValue_String:    return v.value_string.len == 0;
+	case ExactValue_String16:  return v.value_string16.len == 0;
+	case ExactValue_Complex:   return v.value_complex == nullptr ||
+		(v.value_complex->real == 0 && v.value_complex->imag == 0);
+	case ExactValue_Quaternion: return v.value_quaternion == nullptr ||
+		(v.value_quaternion->real == 0 && v.value_quaternion->imag == 0 &&
+		 v.value_quaternion->jmag == 0 && v.value_quaternion->kmag == 0);
+	case ExactValue_Compound:
+	case ExactValue_Procedure:
+		return false; // 保守：复合/过程初始化一律按非零处理
+	}
+	return false;
+}
+
+gb_internal void cg_check_thread_local_initializer(Entity *e, ExactValue const *constant_value) {
+	if (!cg_entity_is_thread_local(e)) {
+		return;
+	}
+	if (constant_value != nullptr && cg_exact_value_is_zero(*constant_value)) {
+		return; // 零初始化：每线程表本来就是 calloc 清零的
+	}
+	GB_PANIC("tilde: @(thread_local) variable '%.*s' has a %s initializer; "
+		"only zero-initialized thread-locals are supported for now",
+		LIT(e->token.string), constant_value ? "non-zero constant" : "runtime (non-constant)");
+}
+
 gb_internal cgAddr cg_build_addr_from_entity(cgProcedure *p, Entity *e, Ast *expr) {
 	GB_ASSERT(e != nullptr);
 	if (e->kind == Entity_Constant) {
@@ -136,6 +253,13 @@ gb_internal cgAddr cg_build_addr_from_entity(cgProcedure *p, Entity *e, Ast *exp
 		cg_global_const_add_region(m, e->Constant.value, t, g, 0);
 		TB_Node *node = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)g);
 		return cg_addr(cg_value(node, alloc_type_pointer(t)));
+	}
+
+	if (cg_entity_is_thread_local(e)) {
+		// NOTE(odin-tilde): Cuik lacks Mach-O TLV sequences; thread-locals
+		// are lowered to offsets into a per-thread table fetched via a
+		// pthread key (runtime __tilde_tls_base). See KNOWN_ISSUES #3.
+		return cg_addr(cg_tls_address(p, e));
 	}
 
 	cgAddr *local_found = map_get(&p->variable_map, e);
@@ -3614,6 +3738,12 @@ gb_internal cgValue cg_find_ident(cgProcedure *p, Entity *e, Ast *expr) {
 	cgAddr *found_addr = map_get(&p->variable_map, e);
 	if (found_addr) {
 		return cg_addr_load(p, *found_addr);
+	}
+
+	if (cg_entity_is_thread_local(e)) {
+		// NOTE(odin-tilde): TLS 变量读也必须走每线程表（写路径在
+		// cg_build_addr_from_entity），否则会读到模板全局的零值。
+		return cg_addr_load(p, cg_addr(cg_tls_address(p, e)));
 	}
 
 	cgValue *found = nullptr;
