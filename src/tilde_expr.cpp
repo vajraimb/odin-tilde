@@ -3794,6 +3794,35 @@ cgAddr cg_build_addr_compound_lit(cgProcedure *p, Ast *expr) {
 	switch (bt->kind) {
 	default: GB_PANIC("Unknown CompoundLit type: %s", type_to_string(type)); break;
 
+	case Type_BitField: {
+		// NOTE(odin-tilde): lower a bit_field compound literal to field-wise
+		// stores through the existing cgAddr_BitField machinery (the local is
+		// zero-initialized, so unmentioned fields stay zero).
+		for (Ast *elem : cl->elems) {
+			ast_node(fv, FieldValue, elem);
+			InternedString interned = fv->field->Ident.interned;
+			Selection sel = lookup_field(bt, interned, false);
+			GB_ASSERT(sel.is_bit_field);
+			GB_ASSERT(!sel.indirect);
+			GB_ASSERT(sel.index.count == 1);
+			GB_ASSERT(sel.entity != nullptr);
+
+			i64 index = sel.index[0];
+			Entity *f = bt->BitField.fields[index];
+			GB_ASSERT(f == sel.entity);
+			i64 bit_offset = bt->BitField.bit_offsets[index];
+			u8 bit_size = bt->BitField.bit_sizes[index];
+			GB_ASSERT(bit_size > 0);
+
+			cgValue field_expr = cg_build_expr(p, fv->value);
+			cgValue ev = cg_emit_conv(p, field_expr, f->type);
+
+			cgValue ptr = cg_addr_get_ptr(p, v);
+			cgAddr field_addr = cg_addr_bit_field(ptr, f->type, bit_offset, bit_size);
+			cg_addr_store(p, field_addr, ev);
+		}
+	} break;
+
 	case Type_Struct: {
 		TypeStruct *st = &bt->Struct;
 		cgValue comp_lit_ptr = cg_addr_get_ptr(p, v);

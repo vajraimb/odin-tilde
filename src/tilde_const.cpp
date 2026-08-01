@@ -492,6 +492,31 @@ gb_internal isize cg_global_const_calculate_region_count(ExactValue const &value
 
 gb_internal TB_Global *cg_global_const_comp_literal(cgModule *m, Type *type, ExactValue const &value, TB_Global *global, i64 base_offset);
 
+// NOTE(odin-tilde): resolve a constant procedure value to its TB symbol,
+// mirroring lb_global_const's ExactValue_Procedure handling (LLVM backend):
+// anonymous proc literals are generated on demand, Entity_Constant chains
+// are followed, and unspecialized polymorphic procedures resolve to nullptr
+// (the caller stores nil in that case).
+gb_internal TB_Symbol *cg_global_const_procedure_symbol(cgModule *m, ExactValue value) {
+	GB_ASSERT(value.kind == ExactValue_Procedure);
+	for (;;) {
+		Ast *expr = unparen_expr(value.value_procedure);
+		GB_ASSERT(expr != nullptr);
+		if (expr->kind == Ast_ProcLit) {
+			cgProcedure *anon = cg_procedure_generate_anonymous(m, expr, nullptr);
+			GB_ASSERT(anon != nullptr && anon->symbol != nullptr);
+			return anon->symbol;
+		}
+		Entity *e = entity_of_node(expr);
+		GB_ASSERT(e != nullptr);
+		if (e->kind != Entity_Constant) {
+			return cg_find_symbol_from_entity(m, e);
+		}
+		value = e->Constant.value;
+		GB_ASSERT(value.kind == ExactValue_Procedure);
+	}
+}
+
 gb_internal bool cg_global_const_add_region(cgModule *m, ExactValue const &value, Type *type, TB_Global *global, i64 offset) {
 	GB_ASSERT(is_type_endian_little(type));
 	GB_ASSERT(!is_type_different_to_arch_endianness(type));
@@ -645,7 +670,17 @@ gb_internal bool cg_global_const_add_region(cgModule *m, ExactValue const &value
 		break;
 
 	case ExactValue_Procedure:
-		GB_PANIC("TODO(bill): nested procedure values/literals\n");
+		{
+			GB_ASSERT_MSG(!is_type_array_like(bt), "%s", type_to_string(type));
+			TB_Symbol *sym = cg_global_const_procedure_symbol(m, value);
+			if (sym != nullptr) {
+				tb_global_add_symbol_reloc(m->mod, global, offset, sym);
+			} else {
+				// Unspecialized polymorphic procedure: store nil (mirror LLVM)
+				void *res = tb_global_add_region(m->mod, global, offset, size);
+				*(u64 *)res = 0;
+			}
+		}
 		break;
 	case ExactValue_Complex:
 		{
@@ -982,25 +1017,35 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 
 	case ExactValue_Procedure:
 		{
-			Ast *expr = unparen_expr(value.value_procedure);
-			if (expr->kind == Ast_ProcLit) {
-				cgProcedure *anon = cg_procedure_generate_anonymous(p->module, expr, p);
-				TB_Node *ptr = tb_inst_get_symbol_address(p->func, anon->symbol);
-				GB_ASSERT(are_types_identical(type, anon->type));
-				return cg_value(ptr, type);
+			// NOTE(odin-tilde): follow Entity_Constant chains like
+			// lb_const_value does (e.g. `foo :: bar` aliases).
+			ExactValue proc_value = value;
+			for (;;) {
+				Ast *expr = unparen_expr(proc_value.value_procedure);
+				if (expr->kind == Ast_ProcLit) {
+					cgProcedure *anon = cg_procedure_generate_anonymous(p->module, expr, p);
+					TB_Node *ptr = tb_inst_get_symbol_address(p->func, anon->symbol);
+					GB_ASSERT(are_types_identical(type, anon->type));
+					return cg_value(ptr, type);
+				}
+
+				Entity *e = entity_of_node(expr);
+				if (e == nullptr) {
+					break;
+				}
+				if (e->kind != Entity_Constant) {
+					TB_Symbol *found = cg_find_symbol_from_entity(p->module, e);
+					GB_ASSERT_MSG(found != nullptr, "could not find '%.*s'", LIT(e->token.string));
+					TB_Node *ptr = tb_inst_get_symbol_address(p->func, found);
+					GB_ASSERT(type != nullptr);
+					GB_ASSERT(are_types_identical(type, e->type));
+					return cg_value(ptr, type);
+				}
+				proc_value = e->Constant.value;
+				GB_ASSERT(proc_value.kind == ExactValue_Procedure);
 			}
 
-			Entity *e = entity_of_node(expr);
-			if (e != nullptr) {
-				TB_Symbol *found = cg_find_symbol_from_entity(p->module, e);
-				GB_ASSERT_MSG(found != nullptr, "could not find '%.*s'", LIT(e->token.string));
-				TB_Node *ptr = tb_inst_get_symbol_address(p->func, found);
-				GB_ASSERT(type != nullptr);
-				GB_ASSERT(are_types_identical(type, e->type));
-				return cg_value(ptr, type);
-			}
-
-			GB_PANIC("TODO(bill): cg_const_value ExactValue_Procedure %s", expr_to_string(expr));
+			GB_PANIC("TODO(bill): cg_const_value ExactValue_Procedure %s", expr_to_string(unparen_expr(value.value_procedure)));
 		}
 		break;
 	}

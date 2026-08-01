@@ -597,9 +597,7 @@ gb_internal cgValue cg_addr_get_ptr(cgProcedure *p, cgAddr const &addr) {
 
 	switch (addr.kind) {
 	case cgAddr_Map:
-		GB_PANIC("TODO(bill): cg_addr_get_ptr cgAddr_Map");
-		// return cg_internal_dynamic_map_get_ptr(p, addr.addr, addr.map.key);
-		break;
+		return cg_internal_dynamic_map_get_ptr(p, addr.addr, addr.map.key);
 
 	case cgAddr_SoaVariable:
 		// TODO(bill): FIX THIS HACK

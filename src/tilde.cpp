@@ -1023,11 +1023,13 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 		cg_add_procedure_to_queue(p);
 	}
 
+	isize single_threaded_drained = 0;
 	if (!m->do_threading) {
 		for (isize i = 0; i < m->single_threaded_procedure_queue.count; i++) {
 			cgProcedure *p = m->single_threaded_procedure_queue[i];
 			cg_procedure_generate(p);
 		}
+		single_threaded_drained = m->single_threaded_procedure_queue.count;
 	}
 
 	thread_pool_wait();
@@ -1073,6 +1075,20 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 		tb_inst_ret(p->func, 0, nullptr);
 		cg_procedure_end(p);
 	}
+
+	// NOTE(odin-tilde): codegen of the startup/cleanup procs (global
+	// initializer expressions, @(init)/@(fini) calls) can discover new
+	// procedures — e.g. anonymous proc literals used as global proc values.
+	// Drain anything queued after the main wait, otherwise those functions
+	// are exported with no body (NULL TB_Function.output) and the x64
+	// emitter dereferences it in emit_call_patches.
+	if (!m->do_threading) {
+		for (isize i = single_threaded_drained; i < m->single_threaded_procedure_queue.count; i++) {
+			cgProcedure *p = m->single_threaded_procedure_queue[i];
+			cg_procedure_generate(p);
+		}
+	}
+	thread_pool_wait();
 
 
 	// NOTE(macos): debug info export is not wired up yet (the Mach-O writer
