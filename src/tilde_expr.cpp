@@ -2622,6 +2622,23 @@ gb_internal cgAddr cg_build_addr_slice_expr(cgProcedure *p, Ast *expr) {
 		return slice;
 	}
 
+	case Type_FixedCapacityDynamicArray: {
+		// NOTE(odin-tilde): mirror the Type_Array path — the data buffer is
+		// inline at offset 0, so slicing produces {base + low*stride, high-low}.
+		Type *slice_type = type_of_expr(expr);
+		GB_ASSERT(is_type_slice(slice_type));
+		if (high.node == nullptr) {
+			high = cg_builtin_len(p, base);
+		}
+		cgValue base_ptr = cg_addr_get_ptr(p, addr);
+		cgValue elem     = cg_emit_ptr_offset(p, cg_builtin_raw_data(p, base_ptr), low);
+		cgValue new_len  = cg_emit_arith(p, Token_Sub, high, low, t_int);
+
+		cgAddr slice = cg_add_local(p, slice_type, nullptr, true);
+		cg_fill_slice(p, slice, elem, new_len);
+		return slice;
+	}
+
 
 	case Type_Struct:
 		if (is_type_soa_struct(type)) {
@@ -2694,7 +2711,7 @@ gb_internal cgAddr cg_build_addr_slice_expr(cgProcedure *p, Ast *expr) {
 
 	}
 
-	GB_PANIC("Unknown slicable type");
+	GB_PANIC("Unknown slicable type: %s (kind=%d)", type_to_string(type), type->kind);
 	return {};
 }
 
@@ -3032,6 +3049,14 @@ gb_internal cgValue cg_build_or_else(cgProcedure *p, Ast *arg, Ast *else_expr, T
 		tb_inst_set_control(p->func, else_);
 
 		cg_build_expr(p, else_expr);
+
+		// PATCH(odin-tilde): the else expression diverges (e.g. `or_else panic(...)`).
+		// Terminate its block explicitly or the panic call's control projection is
+		// left dangling, which crashes Cuik's CFG construction (create_block finds
+		// no control successor for the call proj).
+		if (tb_inst_get_control(p->func)) {
+			tb_inst_unreachable(p->func);
+		}
 
 		tb_inst_set_control(p->func, then);
 		return cg_emit_conv(p, lhs, final_type);

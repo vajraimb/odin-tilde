@@ -224,6 +224,19 @@ gb_internal cgValue cg_builtin_raw_data(cgProcedure *p, cgValue const &value) {
 		}
 		break;
 	case Type_Pointer:
+		if (is_type_fixed_capacity_dynamic_array(t->Pointer.elem)) {
+			// NOTE(odin-tilde): FCDA data buffer is inline at offset 0, so a
+			// ^[dynamic; N]T pointer IS the element data pointer already.
+			TB_Node *base = nullptr;
+			if (value.kind == cgValue_Symbol) {
+				base = tb_inst_get_symbol_address(p->func, value.symbol);
+			} else {
+				GB_ASSERT(value.kind == cgValue_Value || value.kind == cgValue_Addr);
+				base = value.node;
+			}
+			res = cg_value(base, alloc_type_multi_pointer(t->Pointer.elem->FixedCapacityDynamicArray.elem));
+			break;
+		}
 		GB_ASSERT(is_type_array_like(t->Pointer.elem));
 		{
 			// NOTE(odin-tilde): arrays live in memory, so a ^[N]T value may
