@@ -468,11 +468,17 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 	tb_opt_peeps_only(p->func, ws);
 
 	bool emit_asm = false;
-	if (
-	    // string_starts_with(p->name, str_lit("runtime@_windows_default_alloc_or_resize")) ||
-	    false
-	) {
-		emit_asm = true;
+	static gb_thread_local char const *asm_filter = nullptr;
+	static gb_thread_local bool asm_inited = false;
+	if (!asm_inited) { asm_inited = true; asm_filter = getenv("TILDE_ASM"); }
+	if (asm_filter != nullptr) {
+		char namebuf[1024];
+		isize nlen = gb_min(cast(isize)p->name.len, cast(isize)gb_size_of(namebuf)-1);
+		gb_memmove(namebuf, p->name.text, nlen);
+		namebuf[nlen] = 0;
+		if (strstr(namebuf, asm_filter) != nullptr) {
+			emit_asm = true;
+		}
 	}
 
 	// emit ir
@@ -1257,7 +1263,21 @@ gb_internal cgValue cg_build_call_expr_internal(cgProcedure *p, Ast *expr) {
 
 		cgValue value = cg_build_expr(p, fv->value);
 		GB_ASSERT(!is_type_tuple(value.type));
-		args[param_index] = value;
+		// NOTE(odin-tilde): `lookup_procedure_parameter` returns the index in
+		// the FULL parameter tuple (including TypeName/Constant entries), but
+		// `args` only holds slots for Entity_Variable parameters — the
+		// positional loop skips non-Variable entries. Map the tuple index to
+		// the variable ordinal. Hit by `make(Object, allocator=..., loc=...)`
+		// whose callee is proc($T, Allocator, Source_Code_Location).
+		isize var_index = 0;
+		for (isize i = 0; i < param_index; i++) {
+			Entity *pe = pt->params->Tuple.variables[i];
+			if (pe->kind == Entity_Variable) {
+				var_index += 1;
+			}
+		}
+		GB_ASSERT(pt->params->Tuple.variables[param_index]->kind == Entity_Variable);
+		args[var_index] = value;
 	}
 
 	TokenPos pos = ast_token(ce->proc).pos;

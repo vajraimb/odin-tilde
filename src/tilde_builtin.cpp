@@ -142,7 +142,7 @@ gb_internal cgValue cg_builtin_cap(cgProcedure *p, cgValue value) {
 		{
 			TB_DataType dt_uintptr = cg_data_type(t_uintptr);
 			TB_Node *zero = tb_inst_uint(p->func, dt_uintptr, 0);
-			TB_Node *one  = tb_inst_uint(p->func, dt_uintptr, 0);
+			TB_Node *one  = tb_inst_uint(p->func, dt_uintptr, 1);
 			TB_Node *mask = tb_inst_uint(p->func, dt_uintptr, MAP_CACHE_LINE_SIZE-1);
 
 			TB_Node *data = cg_emit_struct_ev(p, value, 0).node;

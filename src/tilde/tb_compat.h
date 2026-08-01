@@ -242,9 +242,27 @@ gb_internal TB_Node *tb_inst_get_symbol_address(TB_Function *f, TB_Symbol *targe
 gb_internal TB_Node *cg_tb_binop_int_diag(TB_Function *f, int type, TB_Node *a, TB_Node *b, TB_ArithmeticBehavior ab) {
 	// TB's integer binops do not accept TB_TAG_BOOL; Odin allows bitwise
 	// ops on booleans, so widen to I8 and truncate the result back.
-	if (a->dt.type == TB_TAG_BOOL && b->dt.type == TB_TAG_BOOL) {
-		TB_Node *ai = tb_builder_cast(cg_tb_g(f), TB_TYPE_I8, TB_ZERO_EXT, a);
-		TB_Node *bi = tb_builder_cast(cg_tb_g(f), TB_TYPE_I8, TB_ZERO_EXT, b);
+	// NOTE(odin-tilde): bool operands can also arrive mixed (e.g. an I8
+	// byte from a no-op conv on one side, a BOOL compare result on the
+	// other, as in `flags |= x == y`), so normalize each side to I8
+	// independently whenever either side is BOOL.
+	if (a->dt.type == TB_TAG_BOOL || b->dt.type == TB_TAG_BOOL) {
+		TB_Node *ai = a;
+		TB_Node *bi = b;
+		if (ai->dt.type == TB_TAG_BOOL) {
+			ai = tb_builder_cast(cg_tb_g(f), TB_TYPE_I8, TB_ZERO_EXT, ai);
+		} else if (ai->dt.type != TB_TAG_I8) {
+			TB_Node *z = tb_builder_uint(cg_tb_g(f), ai->dt, 0);
+			ai = tb_builder_cmp(cg_tb_g(f), TB_CMP_NE, ai, z);
+			ai = tb_builder_cast(cg_tb_g(f), TB_TYPE_I8, TB_ZERO_EXT, ai);
+		}
+		if (bi->dt.type == TB_TAG_BOOL) {
+			bi = tb_builder_cast(cg_tb_g(f), TB_TYPE_I8, TB_ZERO_EXT, bi);
+		} else if (bi->dt.type != TB_TAG_I8) {
+			TB_Node *z = tb_builder_uint(cg_tb_g(f), bi->dt, 0);
+			bi = tb_builder_cmp(cg_tb_g(f), TB_CMP_NE, bi, z);
+			bi = tb_builder_cast(cg_tb_g(f), TB_TYPE_I8, TB_ZERO_EXT, bi);
+		}
 		TB_Node *r  = tb_builder_binop_int(cg_tb_g(f), type, ai, bi, ab);
 		return tb_builder_cast(cg_tb_g(f), TB_TYPE_BOOL, TB_TRUNCATE, r);
 	}

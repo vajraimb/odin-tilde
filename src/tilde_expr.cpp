@@ -1873,18 +1873,20 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 			return cg_emit_conv(p, res, t);
 		}
 
-		// if (is_type_integer_128bit(dst)) {
-		// 	TEMPORARY_ALLOCATOR_GUARD();
-
-		// 	auto args = array_make<lbValue>(temporary_allocator(), 1);
-		// 	args[0] = value;
-		// 	char const *call = "fixunsdfdi";
-		// 	if (is_type_unsigned(dst)) {
-		// 		call = "fixunsdfti";
-		// 	}
-		// 	lbValue res_i128 = lb_emit_runtime_call(p, call, args);
-		// 	return lb_emit_conv(p, res_i128, t);
-		// }
+		if (cg_is_type_integer_128(dst)) {
+			// NOTE(odin-tilde): mirror lb — TB has no i128, go through the
+			// runtime soft helpers (fixunsdfdi / fixunsdfti in
+			// base/runtime/internal_i128.odin), themselves compiled by this
+			// backend on top of the u64 limb primitives.
+			char const *call = "fixunsdfdi";
+			if (is_type_unsigned(dst)) {
+				call = "fixunsdfti";
+			}
+			auto args = slice_make<cgValue>(permanent_allocator(), 1);
+			args[0] = value;
+			cgValue res_i128 = cg_emit_runtime_call(p, call, args);
+			return cg_emit_conv(p, res_i128, t);
+		}
 
 		bool is_signed = !is_type_unsigned(dst);
 		if (type_size_of(src) == 2) {
@@ -1907,18 +1909,17 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 			return cg_emit_conv(p, res, t);
 		}
 
-		// if (is_type_integer_128bit(src)) {
-		// 	TEMPORARY_ALLOCATOR_GUARD();
-
-		// 	auto args = array_make<lbValue>(temporary_allocator(), 1);
-		// 	args[0] = value;
-		// 	char const *call = "floattidf";
-		// 	if (is_type_unsigned(src)) {
-		// 		call = "floattidf_unsigned";
-		// 	}
-		// 	lbValue res_f64 = lb_emit_runtime_call(p, call, args);
-		// 	return lb_emit_conv(p, res_f64, t);
-		// }
+		if (cg_is_type_integer_128(src)) {
+			// NOTE(odin-tilde): mirror lb — TB has no i128, go through the
+			// runtime soft helpers (floattidf / floattidf_unsigned in
+			// base/runtime/internal_i128.odin). json.unmarshal hits this via
+			// assign_float(v, i128_from_parse_i128).
+			bool is_unsigned = is_type_unsigned(src);
+			auto args = slice_make<cgValue>(permanent_allocator(), 1);
+			args[0] = cg_emit_conv(p, value, is_unsigned ? t_u128 : t_i128);
+			cgValue res_f64 = cg_emit_runtime_call(p, is_unsigned ? "floattidf_unsigned" : "floattidf", args);
+			return cg_emit_conv(p, res_f64, t);
+		}
 
 		bool is_signed = !is_type_unsigned(dst);
 		if (type_size_of(dst) == 2) {
