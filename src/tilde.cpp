@@ -440,7 +440,11 @@ gb_internal bool cg_global_variables_create(cgModule *m, Array<cgGlobalVariable>
 			TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
 
 			isize max_regions = cg_global_const_calculate_region_count(tav.value, e->type);
-			tb_global_set_storage(m->mod, section, global, type_size_of(e->type), type_align_of(e->type), max_regions);
+			// NOTE(odin-tilde): Cuik requires size > 0; a zero-sized global
+			// (e.g. struct {}) gets a dummy byte of storage — nobody reads it.
+			i64 gv_size  = gb_max(type_size_of(e->type),  1);
+			i64 gv_align = gb_max(type_align_of(e->type), 1);
+			tb_global_set_storage(m->mod, section, global, gv_size, gv_align, max_regions);
 
 			if (tav.mode == Addressing_Constant &&
 			    tav.value.kind != ExactValue_Invalid) {
@@ -454,7 +458,9 @@ gb_internal bool cg_global_variables_create(cgModule *m, Array<cgGlobalVariable>
 			var.is_initialized = true;
 			// TODO(bill): is this even needed;
 			i64 max_regions = cg_global_const_calculate_region_count_from_basic_type(e->type);
-			tb_global_set_storage(m->mod, section, global, type_size_of(e->type), type_align_of(e->type), max_regions);
+			i64 gv_size  = gb_max(type_size_of(e->type),  1);
+			i64 gv_align = gb_max(type_align_of(e->type), 1);
+			tb_global_set_storage(m->mod, section, global, gv_size, gv_align, max_regions);
 		}
 
 		array_add(global_variables, var);
@@ -1057,6 +1063,10 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 		// itself, so skip cg_procedure_begin entirely.
 		TB_GraphBuilder *g = tb_builder_enter(p->func, tb_module_get_text(p->module->mod), p->proto, nullptr);
 		cg_tb_push_builder(p->func, g);
+		// NOTE(odin-tilde): seed the context stack from the implicit context
+		// parameter — @(init) procs with ProcCC_Odin need a caller context to
+		// forward (cg_procedure_begin is skipped for this dummy proc).
+		cg_push_context_onto_stack_from_implicit_parameter(p);
 		cg_global_variables_initialize(p, &global_variables);
 		// NOTE(odin-tilde): run @(init) procedures (os.init_std_files and
 		// friends) exactly like the LLVM backend's startup runtime does.
@@ -1077,6 +1087,8 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 		cgProcedure *p = cg_cleanup_runtime_proc;
 		TB_GraphBuilder *g = tb_builder_enter(p->func, tb_module_get_text(p->module->mod), p->proto, nullptr);
 		cg_tb_push_builder(p->func, g);
+		// NOTE(odin-tilde): same implicit-context seeding as the startup proc.
+		cg_push_context_onto_stack_from_implicit_parameter(p);
 		// NOTE(odin-tilde): run @(fini) procedures like the LLVM backend
 		// (reverse of init order), sorted for build determinism.
 		Array<Entity *> sorted_finis = array_make<Entity *>(temporary_allocator(), 0, info->fini_procedures.count);

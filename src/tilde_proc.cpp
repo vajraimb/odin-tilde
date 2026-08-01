@@ -59,6 +59,7 @@ gb_internal TB_FunctionPrototype *cg_procedure_type_as_prototype(cgModule *m, Ty
 	}
 
 	TB_DebugType *dbg = cg_debug_type_for_proc(m, type);
+	if (getenv("TILDE_PROTO_DEBUG")) { fprintf(stderr, "[tilde] mkproto %s\n", type_to_string(type)); fflush(stderr); }
 	TB_FunctionPrototype *proto = tb_prototype_from_dbg(m->mod, dbg);
 
 	map_set(&m->proc_proto_map, type, proto);
@@ -151,6 +152,7 @@ gb_internal cgProcedure *cg_procedure_create(cgModule *m, Entity *entity, bool i
 		if (cg_tb_verbose_codegen) {
 			fprintf(stderr, "[tilde] proto %.*s\n", LIT(link_name));
 		}
+		if (getenv("TILDE_PROTO_DEBUG")) { fprintf(stderr, "[tilde] mktype %.*s :: %s\n", LIT(link_name), type_to_string(p->type)); fflush(stderr); }
 		p->debug_type = cg_debug_type_for_proc(m, p->type);
 		p->proto = tb_prototype_from_dbg(m->mod, p->debug_type);
 
@@ -261,6 +263,33 @@ gb_internal cgProcedure *cg_procedure_generate_anonymous(cgModule *m, Ast *expr,
 	cg_add_procedure_to_queue(p);
 	return p;
 
+}
+
+gb_internal void cg_push_context_onto_stack_from_implicit_parameter(cgProcedure *p) {
+	// NOTE(bill): Push context on to stack from implicit parameter
+	GB_ASSERT(p->type->Proc.calling_convention == ProcCC_Odin);
+
+	String name = str_lit("__.context_ptr");
+
+	Entity *e = alloc_entity_param(nullptr, make_token_ident(name), t_context_ptr, false, false);
+	e->flags |= EntityFlag_NoAlias;
+
+	TB_Node *param_ptr = tb_inst_param(p->func, p->proto->param_count-1);
+	cgValue local = cg_value(param_ptr, t_context_ptr);
+	cgAddr addr = cg_addr(local);
+	// NOTE(odin-tilde): the implicit context parameter must keep
+	// cgAddr_Context kind (mirrors lb_push_context_onto_stack_from_implicit_parameter);
+	// otherwise `context.x = v` stores bypass the copy-on-write
+	// context machinery and clobber the caller-visible context
+	// (inner scopes leaked writes to outer scopes).
+	addr.kind = cgAddr_Context;
+	map_set(&p->variable_map, e, addr);
+
+
+	cgContextData *cd = array_add_and_get(&p->context_stack);
+	cd->ctx = addr;
+	cd->scope_index = -1;
+	cd->uses = +1; // make sure it has been used already
 }
 
 gb_internal void cg_procedure_begin(cgProcedure *p) {
@@ -374,29 +403,7 @@ gb_internal void cg_procedure_begin(cgProcedure *p) {
 	}
 
 	if (pt->calling_convention == ProcCC_Odin) {
-		// NOTE(bill): Push context on to stack from implicit parameter
-
-		String name = str_lit("__.context_ptr");
-
-		Entity *e = alloc_entity_param(nullptr, make_token_ident(name), t_context_ptr, false, false);
-		e->flags |= EntityFlag_NoAlias;
-
-		TB_Node *param_ptr = tb_inst_param(p->func, param_count-1);
-		cgValue local = cg_value(param_ptr, t_context_ptr);
-		cgAddr addr = cg_addr(local);
-		// NOTE(odin-tilde): the implicit context parameter must keep
-		// cgAddr_Context kind (mirrors lb_push_context_onto_stack_from_implicit_parameter);
-		// otherwise `context.x = v` stores bypass the copy-on-write
-		// context machinery and clobber the caller-visible context
-		// (inner scopes leaked writes to outer scopes).
-		addr.kind = cgAddr_Context;
-		map_set(&p->variable_map, e, addr);
-
-
-		cgContextData *cd = array_add_and_get(&p->context_stack);
-		cd->ctx = addr;
-		cd->scope_index = -1;
-		cd->uses = +1; // make sure it has been used already
+		cg_push_context_onto_stack_from_implicit_parameter(p);
 	}
 
 	if (pt->has_named_results) {

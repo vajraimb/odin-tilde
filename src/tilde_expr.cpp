@@ -337,11 +337,29 @@ gb_internal void cg_emit_store_union_variant(cgProcedure *p, cgValue parent_ptr,
 
 	if (pt->Union.kind == UnionType_shared_nil) {
 		// All variants share a nil value; a nil variant means a nil union.
-		// TODO(bill): proper nil-branching like lb_emit_store_union_variant
-		if (type_size_of(variant_type) != 0) {
-			cg_emit_store(p, variant_ptr, value);
-		}
+		// NOTE(odin-tilde): proper nil-branching, ported from
+		// lb_emit_store_union_variant — without it a zero-valued variant
+		// (e.g. Allocator_Error.None) got its real tag instead of collapsing
+		// to a nil union, breaking `err != nil` / or_return checks.
+		GB_ASSERT(type_size_of(variant_type));
+
+		TB_Node *if_nil     = cg_control_region(p, "shared_nil_if_nil");
+		TB_Node *if_not_nil = cg_control_region(p, "shared_nil_if_not_nil");
+		TB_Node *done       = cg_control_region(p, "shared_nil_done");
+
+		cgValue cond_is_nil = cg_emit_comp_against_nil(p, Token_CmpEq, value);
+		tb_inst_if(p->func, cond_is_nil.node, if_nil, if_not_nil);
+
+		tb_inst_set_control(p->func, if_nil);
+		cg_emit_store(p, parent_ptr, cg_const_nil(p, type_deref(parent_ptr.type)));
+		tb_inst_goto(p->func, done);
+
+		tb_inst_set_control(p->func, if_not_nil);
+		cg_emit_store(p, variant_ptr, value);
 		cg_emit_store(p, cg_emit_union_tag_ptr(p, parent_ptr), cg_const_union_tag(p, pt, variant_type));
+		tb_inst_goto(p->func, done);
+
+		tb_inst_set_control(p->func, done);
 		return;
 	}
 
@@ -1018,6 +1036,51 @@ gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left
 
 	if ((is_type_struct(b) || is_type_union(b)) && is_type_comparable(b)) {
 		return cg_emit_comp_records(p, op_kind, left, right, b);
+	}
+
+	if (is_type_string16(a) || is_type_cstring16(a)) {
+		// NOTE(odin-tilde): ported from lb_emit_comp — wide strings have their
+		// own runtime comparisons; never mix with the UTF-8 string_eq family.
+		if (is_type_cstring16(a) && is_type_cstring16(b)) {
+			left  = cg_emit_conv(p, left, t_cstring16);
+			right = cg_emit_conv(p, right, t_cstring16);
+			char const *runtime_procedure = nullptr;
+			switch (op_kind) {
+			case Token_CmpEq: runtime_procedure = "cstring16_eq"; break;
+			case Token_NotEq: runtime_procedure = "cstring16_ne"; break;
+			case Token_Lt:    runtime_procedure = "cstring16_lt"; break;
+			case Token_Gt:    runtime_procedure = "cstring16_gt"; break;
+			case Token_LtEq:  runtime_procedure = "cstring16_le"; break;
+			case Token_GtEq:  runtime_procedure = "cstring16_ge"; break;
+			}
+			GB_ASSERT(runtime_procedure != nullptr);
+
+			auto args = slice_make<cgValue>(permanent_allocator(), 2);
+			args[0] = left;
+			args[1] = right;
+			return cg_emit_runtime_call(p, runtime_procedure, args);
+		}
+
+		if (is_type_cstring16(a) ^ is_type_cstring16(b)) {
+			left  = cg_emit_conv(p, left, t_string16);
+			right = cg_emit_conv(p, right, t_string16);
+		}
+
+		char const *runtime_procedure = nullptr;
+		switch (op_kind) {
+		case Token_CmpEq: runtime_procedure = "string16_eq"; break;
+		case Token_NotEq: runtime_procedure = "string16_ne"; break;
+		case Token_Lt:    runtime_procedure = "string16_lt"; break;
+		case Token_Gt:    runtime_procedure = "string16_gt"; break;
+		case Token_LtEq:  runtime_procedure = "string16_le"; break;
+		case Token_GtEq:  runtime_procedure = "string16_ge"; break;
+		}
+		GB_ASSERT(runtime_procedure != nullptr);
+
+		auto args = slice_make<cgValue>(permanent_allocator(), 2);
+		args[0] = left;
+		args[1] = right;
+		return cg_emit_runtime_call(p, runtime_procedure, args);
 	}
 
 	if (is_type_string(a)) {
@@ -3084,6 +3147,23 @@ gb_internal void cg_build_try_lhs_rhs(cgProcedure *p, Ast *arg, Type *final_type
 				lhs = cg_value_multi(slice(values, 0, values.count-1), final_type);
 			}
 		}
+	} else if (is_type_tuple(value.type)) {
+		// NOTE(odin-tilde): single materialized tuple value (e.g. the (ptr, ok)
+		// pair produced by `&m[k]`, see cg_build_unary_and); lb handles this by
+		// shape (is_type_tuple) rather than by value kind. Split it: lhs = all
+		// but the trailing ok, rhs = the trailing ok.
+		isize n = value.type->Tuple.variables.count - 1;
+		cgValue addr = cg_address_from_load_or_generate_local(p, value);
+		if (n == 1) {
+			lhs = cg_emit_load(p, cg_emit_struct_ep(p, addr, 0));
+		} else {
+			auto vals = slice_make<cgValue>(permanent_allocator(), n);
+			for (isize i = 0; i < n; i++) {
+				vals[i] = cg_emit_load(p, cg_emit_struct_ep(p, addr, cast(i32)i));
+			}
+			lhs = cg_value_multi(vals, final_type);
+		}
+		rhs = cg_emit_load(p, cg_emit_struct_ep(p, addr, cast(i32)n));
 	} else {
 		rhs = value;
 	}
@@ -4295,36 +4375,37 @@ gb_internal cgValue cg_build_unary_and(cgProcedure *p, Ast *expr) {
 
 	Ast *ue_expr = unparen_expr(ue->expr);
 	if (ue_expr->kind == Ast_IndexExpr && tv.mode == Addressing_OptionalOkPtr && is_type_tuple(tv.type)) {
-		GB_PANIC("TODO(bill): &m[k]");
-		// Type *tuple = tv.type;
+		// NOTE(odin-tilde): &m[k] — ported from lb_build_unary_and. Yields the
+		// (ptr, ok) tuple: ptr into the map cell (nil if absent), ok = ptr != nil.
+		Type *tuple = tv.type;
 
-		// Type *map_type = type_of_expr(ue_expr->IndexExpr.expr);
-		// Type *ot = base_type(map_type);
-		// Type *t = base_type(type_deref(ot));
-		// bool deref = t != ot;
-		// GB_ASSERT(t->kind == Type_Map);
-		// ast_node(ie, IndexExpr, ue_expr);
+		Type *map_type = type_of_expr(ue_expr->IndexExpr.expr);
+		Type *ot = base_type(map_type);
+		Type *t = base_type(type_deref(ot));
+		bool deref = t != ot;
+		GB_ASSERT(t->kind == Type_Map);
+		ast_node(ie, IndexExpr, ue_expr);
 
-		// cgValue map_val = cg_build_addr_ptr(p, ie->expr);
-		// if (deref) {
-		// 	map_val = cg_emit_load(p, map_val);
-		// }
+		cgValue map_val = cg_build_addr_ptr(p, ie->expr);
+		if (deref) {
+			map_val = cg_emit_load(p, map_val);
+		}
 
-		// cgValue key = lb_build_expr(p, ie->index);
-		// key = lb_emit_conv(p, key, t->Map.key);
+		cgValue key = cg_build_expr(p, ie->index);
+		key = cg_emit_conv(p, key, t->Map.key);
 
-		// lbAddr addr = lb_addr_map(map_val, key, t, alloc_type_pointer(t->Map.value));
-		// lbValue ptr = lb_addr_get_ptr(p, addr);
+		cgAddr addr = cg_addr_map(map_val, key, t, alloc_type_pointer(t->Map.value));
+		cgValue ptr = cg_addr_get_ptr(p, addr);
 
-		// lbValue ok = lb_emit_comp_against_nil(p, Token_NotEq, ptr);
-		// ok = lb_emit_conv(p, ok, tuple->Tuple.variables[1]->type);
+		cgValue ok = cg_emit_comp_against_nil(p, Token_NotEq, ptr);
+		ok = cg_emit_conv(p, ok, tuple->Tuple.variables[1]->type);
 
-		// lbAddr res = lb_add_local_generated(p, tuple, false);
-		// lbValue gep0 = lb_emit_struct_ep(p, res.addr, 0);
-		// lbValue gep1 = lb_emit_struct_ep(p, res.addr, 1);
-		// lb_emit_store(p, gep0, ptr);
-		// lb_emit_store(p, gep1, ok);
-		// return lb_addr_load(p, res);
+		cgAddr res = cg_add_local(p, tuple, nullptr, false);
+		cgValue gep0 = cg_emit_struct_ep(p, res.addr, 0);
+		cgValue gep1 = cg_emit_struct_ep(p, res.addr, 1);
+		cg_emit_store(p, gep0, ptr);
+		cg_emit_store(p, gep1, ok);
+		return cg_addr_load(p, res);
 
 	} else if (is_type_soa_pointer(tv.type)) {
 		ast_node(ie, IndexExpr, ue_expr);
@@ -4726,8 +4807,18 @@ gb_internal cgValue cg_build_expr_internal(cgProcedure *p, Ast *expr) {
 
 	switch (expr->kind) {
 	case_ast_node(bl, BasicLit, expr);
-		TokenPos pos = bl->token.pos;
-		GB_PANIC("Non-constant basic literal %s - %.*s", token_pos_to_string(pos), LIT(token_strings[bl->token.kind]));
+		// NOTE(odin-tilde): mirrors lb — os.Error's zero literal does not get a
+		// constant tav value (`if err != 0`); emit the nil value for the type.
+		if (type != nullptr && type->kind == Type_Named && type->Named.name == "Error") {
+			Entity *e = type->Named.type_name;
+			if (e->pkg && e->pkg->name == "os") {
+				return cg_const_nil(p, type);
+			}
+		}
+		{
+			TokenPos pos = bl->token.pos;
+			GB_PANIC("Non-constant basic literal %s - %.*s", token_pos_to_string(pos), LIT(token_strings[bl->token.kind]));
+		}
 	case_end;
 
 	case_ast_node(bd, BasicDirective, expr);
@@ -5552,6 +5643,18 @@ gb_internal cgAddr cg_build_addr_internal(cgProcedure *p, Ast *expr) {
 
 	case_ast_node(cl, CompoundLit, expr);
 		return cg_build_addr_compound_lit(p, expr);
+	case_end;
+
+	case_ast_node(ue, UnaryExpr, expr);
+		// NOTE(odin-tilde): mirrors lb_build_addr_internal — address of `&x`
+		// (e.g. iterating `&m` by reference) is the pointer value itself,
+		// materialized to an lvalue.
+		switch (ue->op.kind) {
+		case Token_And:
+			return cg_addr(cg_address_from_load_or_generate_local(p, cg_build_expr(p, expr)));
+		default:
+			GB_PANIC("Invalid unary expression for cg_build_addr");
+		}
 	case_end;
 
 	case_ast_node(ie, MatrixIndexExpr, expr);

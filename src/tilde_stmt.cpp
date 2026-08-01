@@ -1351,12 +1351,11 @@ gb_internal void cg_build_assign_stmt(cgProcedure *p, AstAssignStmt *as) {
 	TokenKind op = cast(TokenKind)op_;
 
 	if (op == Token_CmpAnd || op == Token_CmpOr) {
-		GB_PANIC("TODO(bill): cg_emit_logical_binary_expr");
-		// Type *type = as->lhs[0]->tav.type;
-		// cgValue new_value = cg_emit_logical_binary_expr(p, op, as->lhs[0], as->rhs[0], type);
+		Type *type = as->lhs[0]->tav.type;
+		cgValue new_value = cg_build_logical_binary_expr(p, op, as->lhs[0], as->rhs[0], type);
 
-		// cgAddr lhs = cg_build_addr(p, as->lhs[0]);
-		// cg_addr_store(p, lhs, new_value);
+		cgAddr lhs = cg_build_addr(p, as->lhs[0]);
+		cg_addr_store(p, lhs, new_value);
 	} else {
 		cgAddr lhs = cg_build_addr(p, as->lhs[0]);
 		cgValue value = cg_build_expr(p, as->rhs[0]);
@@ -1435,7 +1434,11 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 			if (result.kind == cgValue_Addr) {
 				TB_CharUnits align = cast(TB_CharUnits)type_align_of(result.type);
 				i64 rsz = type_size_of(result.type);
-				if (rsz <= 8 && rsz != 1 && rsz != 2 && rsz != 4 && rsz != 8) {
+				if (rsz == 0) {
+					// NOTE(odin-tilde): zero-sized result rides the ABI as a
+					// dummy byte (see Cuik abi.c case 0); contents unused.
+					final_res = tb_inst_uint(p->func, dt, 0);
+				} else if (rsz <= 8 && rsz != 1 && rsz != 2 && rsz != 4 && rsz != 8) {
 					// odd-sized aggregate: compose the blob from chunk loads
 					// so we never read past the object
 					final_res = cg_load_gpr_blob(p, result.node, rsz, align);

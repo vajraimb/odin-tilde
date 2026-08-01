@@ -336,6 +336,7 @@ gb_internal void cg_add_procedure_to_queue(cgProcedure *p);
 gb_internal void cg_add_foreign_library_path(cgModule *m, Entity *e);
 gb_internal void cg_setup_type_info_data(cgModule *m);
 gb_internal cgProcedure *cg_procedure_generate_anonymous(cgModule *m, Ast *expr, cgProcedure *parent);
+gb_internal void cg_push_context_onto_stack_from_implicit_parameter(cgProcedure *p);
 
 gb_internal isize cg_global_const_calculate_region_count(ExactValue const &value, Type *type);
 gb_internal i64   cg_global_const_calculate_region_count_from_basic_type(Type *type);

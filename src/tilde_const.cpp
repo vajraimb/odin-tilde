@@ -1205,6 +1205,40 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 
 			String str = value.value_string;
 
+			// NOTE(odin-tilde): string16/cstring16 constants need UTF-16
+			// element data (mirrors lb_const_value); the u8 path below is
+			// string/cstring only.
+			if (is_type_string16(type) || is_type_cstring16(type)) {
+				TEMPORARY_ALLOCATOR_GUARD();
+				String16 s16 = string_to_string16(temporary_allocator(), str);
+
+				String name = cg_generated_name(m, p, "csb16");
+				TB_Global *cstr_global = tb_global_create(m->mod, name.len, cast(char const *)name.text, nullptr, TB_LINKAGE_PRIVATE);
+
+				i64 size = (s16.len+1)*2;
+				tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), cstr_global, size, 2, 1);
+				u8 *data = cast(u8 *)tb_global_add_region(m->mod, cstr_global, 0, size);
+				gb_memcopy(data, s16.text, s16.len*2);
+				data[s16.len*2+0] = 0;
+				data[s16.len*2+1] = 0;
+
+				if (is_type_cstring16(type)) {
+					cgValue s = cg_value(cstr_global, type);
+					return cg_flatten_value(p, s);
+				}
+
+				String str_name = cg_generated_name(m, p, "str");
+				TB_Global *str_global = tb_global_create(m->mod, str_name.len, cast(char const *)str_name.text, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
+				tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), str_global, type_size_of(type), type_align_of(type), 2);
+
+				tb_global_add_symbol_reloc(m->mod, str_global, 0, cast(TB_Symbol *)cstr_global);
+				void *len_ptr = tb_global_add_region(m->mod, str_global, build_context.int_size, build_context.int_size);
+				cg_write_int_at_ptr(len_ptr, s16.len, t_int);
+
+				TB_Node *s = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)str_global);
+				return cg_lvalue_addr(s, type);
+			}
+
 			String name = cg_generated_name(m, p, "csb");
 			TB_Global *cstr_global = tb_global_create(m->mod, name.len, cast(char const *)name.text, nullptr, TB_LINKAGE_PRIVATE);
 
