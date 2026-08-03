@@ -968,6 +968,145 @@ gb_internal void cg_add_procedure_to_queue(cgProcedure *p) {
 	}
 }
 
+gb_internal cgValue cg_find_runtime_value(cgModule *m, String const &name) {
+	AstPackage *pkg = m->info->runtime_package;
+	Entity *e = scope_lookup_current(pkg->scope, string_interner_insert(name));
+	return cg_find_value_from_entity(m, e);
+}
+gb_internal cgValue cg_find_package_value(cgModule *m, String const &pkg, String const &name) {
+	Entity *e = find_entity_in_pkg(m->info, pkg, name);
+	return cg_find_value_from_entity(m, e);
+}
+
+// NOTE(odin-tilde): port of lb_create_main_procedure — synthesizes the C
+// entry point for `odin test` (the runtime's own main is compiled out under
+// ODIN_TEST). Only the unix/CRT path is implemented: the tilde backend
+// currently targets macOS (x86_64) only. Windows DllMain/mainCRTStartup and
+// wasm _start variants from lb_create_main_procedure are intentionally left
+// out until those targets exist.
+gb_internal cgProcedure *cg_create_main_procedure(cgModule *m, cgProcedure *startup_runtime, cgProcedure *cleanup_runtime) {
+	Type *params  = alloc_type_tuple();
+	Type *results = alloc_type_tuple();
+
+	Type *t_ptr_cstring = alloc_type_pointer(t_cstring);
+
+	String name = str_lit("main");
+	bool has_args = true;
+	slice_init(&params->Tuple.variables, permanent_allocator(), 2);
+	params->Tuple.variables[0] = alloc_entity_param(nullptr, make_token_ident("argc"), t_i32,         false, true);
+	params->Tuple.variables[1] = alloc_entity_param(nullptr, make_token_ident("argv"), t_ptr_cstring, false, true);
+
+	slice_init(&results->Tuple.variables, permanent_allocator(), 1);
+	results->Tuple.variables[0] = alloc_entity_param(nullptr, blank_token, t_i32, false, true);
+
+	Type *proc_type = alloc_type_proc(nullptr,
+		params, params->Tuple.variables.count,
+		results, results->Tuple.variables.count, false, ProcCC_CDecl);
+
+	cgProcedure *p = cg_procedure_create_dummy(m, name, proc_type);
+	p->is_startup = true;
+	// dummy procs default to private linkage; main must be visible to libc
+	// (TB_Function is opaque in the public header, but TB_Symbol is its first
+	// member — same cast idiom used throughout the backend).
+	(cast(TB_Symbol *)p->func)->linkage = TB_LINKAGE_PUBLIC;
+
+	// dummy proc has no Ast body; tb_builder_enter applies the prototype
+	// itself, so skip cg_procedure_begin entirely (same idiom as the
+	// startup/cleanup runtime procs in cg_generate_code).
+	TB_GraphBuilder *g = tb_builder_enter(p->func, tb_module_get_text(m->mod), p->proto, nullptr);
+	cg_tb_push_builder(p->func, g);
+
+	// C-decl procs get a fresh (zeroed) local context; initialize it like
+	// lb_emit_init_context does so the test runner has usable allocators.
+	cgAddr ctx_addr = cg_find_or_generate_context_ptr(p);
+	{
+		Entity *e = scope_lookup_current(m->info->runtime_package->scope, string_interner_insert(str_lit("__init_context")));
+		GB_ASSERT_MSG(e != nullptr, "missing runtime.__init_context");
+		cgValue init_context = cg_find_procedure_value_from_entity(m, e);
+		TEMPORARY_ALLOCATOR_GUARD();
+		auto init_args = slice_make<cgValue>(temporary_allocator(), 1);
+		init_args[0] = ctx_addr.addr;
+		cg_emit_call(p, init_context, init_args);
+	}
+
+	if (has_args) { // initialize `runtime.args__`
+		cgValue argc = cg_value(tb_inst_param(p->func, 0), t_i32);
+		cgValue argv = cg_value(tb_inst_param(p->func, 1), t_ptr_cstring);
+		argc = cg_emit_conv(p, argc, t_int);
+		cgAddr args = cg_addr(cg_find_runtime_value(m, str_lit("args__")));
+		cg_fill_slice(p, args, argv, argc);
+	}
+
+	cgValue startup_runtime_value = cg_value(startup_runtime->symbol, startup_runtime->type);
+	cg_emit_call(p, startup_runtime_value, {});
+
+	GB_ASSERT(build_context.command_kind == Command_test);
+	{
+		Type *t_Internal_Test = find_type_in_pkg(m->info, str_lit("testing"), str_lit("Internal_Test"));
+		Type *array_type = alloc_type_array(t_Internal_Test, m->info->testing_procedures.count);
+		Type *slice_type = alloc_type_slice(t_Internal_Test);
+
+		String arr_name = str_lit("__$all_tests_array");
+		TB_Global *arr_global = tb_global_create(m->mod, arr_name.len, cast(char const *)arr_name.text, cg_debug_type(m, array_type), TB_LINKAGE_PRIVATE);
+		tb_global_set_storage(m->mod, tb_module_get_data(m->mod), arr_global,
+		                      type_size_of(array_type), type_align_of(array_type), 0);
+		cgValue all_tests_array = cg_value(tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)arr_global),
+		                                   alloc_type_pointer(array_type));
+
+		isize testing_proc_index = 0;
+		for (Entity *testing_proc : m->info->testing_procedures) {
+			String test_name = testing_proc->token.string;
+
+			String pkg_name = {};
+			if (testing_proc->pkg != nullptr) {
+				pkg_name = testing_proc->pkg->name;
+			}
+			cgValue v_pkg  = cg_const_string(p, t_string, pkg_name);
+			cgValue v_name = cg_const_string(p, t_string, test_name);
+			cgValue v_proc = cg_find_procedure_value_from_entity(m, testing_proc);
+
+			cgValue elem = cg_emit_array_epi(p, all_tests_array, testing_proc_index++);
+			cg_emit_store(p, cg_emit_struct_ep(p, elem, 0), v_pkg);
+			cg_emit_store(p, cg_emit_struct_ep(p, elem, 1), v_name);
+			cg_emit_store(p, cg_emit_struct_ep(p, elem, 2), v_proc);
+		}
+
+		cgAddr all_tests_slice = cg_add_local(p, slice_type, nullptr, true);
+		cg_fill_slice(p, all_tests_slice,
+		              cg_emit_array_epi(p, all_tests_array, 0),
+		              cg_const_int(p, t_int, m->info->testing_procedures.count));
+
+		cgValue runner = cg_find_package_value(m, str_lit("testing"), str_lit("runner"));
+
+		TEMPORARY_ALLOCATOR_GUARD();
+		auto args = slice_make<cgValue>(temporary_allocator(), 1);
+		args[0] = cg_addr_load(p, all_tests_slice);
+		cgValue result = cg_emit_call(p, runner, args);
+
+		cgValue exit_runner = {};
+		{
+			AstPackage *pkg = get_runtime_package(m->info);
+
+			String exit_name = str_lit("exit");
+			Entity *e = scope_lookup_current(pkg->scope, string_interner_insert(exit_name));
+			if (e == nullptr) {
+				compiler_error("Could not find type declaration for '%.*s.%.*s'\n", LIT(pkg->name), LIT(exit_name));
+			}
+			exit_runner = cg_find_value_from_entity(m, e);
+		}
+
+		auto exit_args = slice_make<cgValue>(temporary_allocator(), 1);
+		exit_args[0] = cg_emit_select(p, result, cg_const_int(p, t_int, 0), cg_const_int(p, t_int, 1));
+		cg_emit_call(p, exit_runner, exit_args);
+	}
+
+	// no explicit terminator: runtime.exit is `-> !`, and cg_procedure_end
+	// emits unreachable for any still-open block of a proc with results.
+	cg_procedure_end(p);
+
+	return p;
+}
+
 gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 	TIME_SECTION("Tilde Module Initializtion");
 
@@ -998,7 +1137,6 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 
 	Array<cgGlobalVariable> global_variables = {};
 	bool already_has_entry_point = cg_global_variables_create(m, &global_variables);
-	gb_unused(already_has_entry_point);
 
 	if (true) {
 		Type *proc_type = alloc_type_proc(nullptr, nullptr, 0, nullptr, 0, false, ProcCC_Odin);
@@ -1103,6 +1241,16 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 		}
 		tb_inst_ret(p->func, 0, nullptr);
 		cg_procedure_end(p);
+	}
+
+	// NOTE(odin-tilde): `odin test` compiles the runtime's own main out
+	// (ODIN_TEST), so synthesize the C entry point here — mirrors the LLVM
+	// backend's "LLVM main" step. Built BEFORE the late-proc drain below so
+	// that anything it lazily references (e.g. runtime.__init_context) is
+	// still codegen'd in the single-threaded drain.
+	if (build_context.command_kind == Command_test && !already_has_entry_point) {
+		TIME_SECTION("Tilde main");
+		cg_create_main_procedure(m, cg_startup_runtime_proc, cg_cleanup_runtime_proc);
 	}
 
 	// NOTE(odin-tilde): codegen of the startup/cleanup procs (global
