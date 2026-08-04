@@ -1278,6 +1278,14 @@ gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left
 	} else if (is_type_float(a)) {
 	    	TB_Node *lhs = left.node;
 		TB_Node *rhs = right.node;
+		// NOTE(odin-tilde): f16 is kept as an I16 bit pattern (TB has no f16
+		// float ops). Comparing bit patterns as integers would give wrong
+		// float semantics (NaN, -0.0), so promote both sides to f32 first —
+		// the widening is exact and preserves f16 comparison semantics.
+		if (type_size_of(a) == 2) {
+			lhs = cg_emit_conv(p, left,  t_f32).node;
+			rhs = cg_emit_conv(p, right, t_f32).node;
+		}
 		TB_Node *res = nullptr;
 		switch (op_kind) {
 		case Token_CmpEq: res = tb_inst_cmp_eq(p->func, lhs, rhs);  break;
@@ -1544,11 +1552,16 @@ gb_internal TB_Node *cg_tb_f32_to_f16_node(TB_Function *f, TB_Node *f32) {
 	TB_Node *zero = tb_inst_uint(f, TB_TYPE_I32, 0);
 	TB_Node *one  = tb_inst_uint(f, TB_TYPE_I32, 1);
 
-	// inf/nan input: keep nan as nan
-	TB_Node *nan_bit = cg_tb_bool_to_i32(f, tb_inst_cmp_ne(f, mant, zero));
+	// inf/nan input: keep nan as nan. The payload is mant>>13 (matching
+	// vcvtps2ph/__gnu_f2h_ieee); only when those high payload bits are all
+	// zero do we force the LSB so a NaN never degrades into an infinity.
+	TB_Node *payload = tb_inst_shr(f, mant, tb_inst_uint(f, TB_TYPE_I32, 13));
+	TB_Node *is_nan  = tb_inst_cmp_ne(f, mant, zero);
+	TB_Node *guard   = tb_inst_and(f, cg_tb_bool_to_i32(f, is_nan),
+		cg_tb_bool_to_i32(f, tb_inst_cmp_eq(f, payload, zero)));
 	TB_Node *infnan = tb_inst_or(f, sign,
 		tb_inst_or(f, tb_inst_uint(f, TB_TYPE_I32, 0x7c00),
-			tb_inst_or(f, tb_inst_shr(f, mant, tb_inst_uint(f, TB_TYPE_I32, 13)), nan_bit)));
+			tb_inst_or(f, payload, guard)));
 
 	// e = f16-biased exponent (signed)
 	TB_Node *e = tb_inst_sub(f, exp, tb_inst_uint(f, TB_TYPE_I32, 112), TB_ARITHMATIC_NONE);
@@ -2573,6 +2586,31 @@ handle_op:;
 		switch (op) {
 		case Token_Add: op = Token_Or;     break;
 		case Token_Sub: op = Token_AndNot; break;
+		}
+	}
+
+	// NOTE(odin-tilde): f16 is kept as an I16 bit pattern (TB has no f16
+	// float ops). Promote to f32, do the arithmetic there, then round the
+	// result back to f16 (round-to-nearest-even) — this matches the single
+	// rounding of native f16 arithmetic. Endianness variants are already
+	// normalized to platform f16 above, so the bit patterns need no swap.
+	if (is_type_float(type) && type_size_of(type) == 2) {
+		switch (op) {
+		case Token_Add:
+		case Token_Sub:
+		case Token_Mul:
+		case Token_Quo: {
+			TB_Node *x = cg_tb_f16_to_f32_node(p->func, lhs.node);
+			TB_Node *y = cg_tb_f16_to_f32_node(p->func, rhs.node);
+			TB_Node *res = nullptr;
+			switch (op) {
+			case Token_Add: res = tb_inst_fadd(p->func, x, y); break;
+			case Token_Sub: res = tb_inst_fsub(p->func, x, y); break;
+			case Token_Mul: res = tb_inst_fmul(p->func, x, y); break;
+			case Token_Quo: res = tb_inst_fdiv(p->func, x, y); break;
+			}
+			return cg_value(cg_tb_f32_to_f16_node(p->func, res), type);
+		}
 		}
 	}
 
