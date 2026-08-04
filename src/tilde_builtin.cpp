@@ -413,11 +413,10 @@ gb_internal cgValue cg_builtin_map_cell_info(cgProcedure *p, Type *type) {
 	return cg_value(node, t_map_cell_info_ptr);
 }
 
-gb_internal cgValue cg_builtin_map_info(cgProcedure *p, Type *map_type) {
+gb_internal TB_Symbol *cg_map_info_symbol(cgModule *m, Type *map_type) {
 	map_type = base_type(map_type);
 	GB_ASSERT(map_type->kind == Type_Map);
 
-	cgModule *m = p->module;
 	MUTEX_GUARD(&m->map_info_mutex);
 	TB_Global *global = nullptr;
 	TB_Symbol **found = map_get(&m->map_info_map, map_type);
@@ -439,20 +438,25 @@ gb_internal cgValue cg_builtin_map_info(cgProcedure *p, Type *map_type) {
 
 		TB_Symbol *key_cell_info   = cg_builtin_map_cell_info_symbol(m, map_type->Map.key);
 		TB_Symbol *value_cell_info = cg_builtin_map_cell_info_symbol(m, map_type->Map.value);
-		cgProcedure *key_hasher    = cg_hasher_proc_for_type(p->module, map_type->Map.key);
-		cgProcedure *key_equal     = cg_equal_proc_for_type (p->module, map_type->Map.key);
+		cgProcedure *key_hasher    = cg_hasher_proc_for_type(m, map_type->Map.key);
+		cgProcedure *key_equal     = cg_equal_proc_for_type (m, map_type->Map.key);
 
-		tb_global_add_symbol_reloc(p->module->mod, global, 0*build_context.ptr_size, key_cell_info);
-		tb_global_add_symbol_reloc(p->module->mod, global, 1*build_context.ptr_size, value_cell_info);
-		tb_global_add_symbol_reloc(p->module->mod, global, 2*build_context.ptr_size, key_hasher->symbol);
-		tb_global_add_symbol_reloc(p->module->mod, global, 3*build_context.ptr_size, key_equal->symbol);
+		tb_global_add_symbol_reloc(m->mod, global, 0*build_context.ptr_size, key_cell_info);
+		tb_global_add_symbol_reloc(m->mod, global, 1*build_context.ptr_size, value_cell_info);
+		tb_global_add_symbol_reloc(m->mod, global, 2*build_context.ptr_size, key_hasher->symbol);
+		tb_global_add_symbol_reloc(m->mod, global, 3*build_context.ptr_size, key_equal->symbol);
 
 		map_set(&m->map_info_map, map_type, cast(TB_Symbol *)global);
 		}
 	}
 
 	GB_ASSERT(global != nullptr);
-	TB_Node *node = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)global);
+	return cast(TB_Symbol *)global;
+}
+
+gb_internal cgValue cg_builtin_map_info(cgProcedure *p, Type *map_type) {
+	TB_Symbol *symbol = cg_map_info_symbol(p->module, map_type);
+	TB_Node *node = tb_inst_get_symbol_address(p->func, symbol);
 	return cg_value(node, t_map_info_ptr);
 }
 

@@ -479,6 +479,7 @@ gb_internal cgValue cg_handle_param_value(cgProcedure *p, Type *parameter_type, 
 gb_internal cgValue cg_builtin_len(cgProcedure *p, cgValue value);
 gb_internal cgValue cg_builtin_raw_data(cgProcedure *p, cgValue const &x);
 gb_internal cgValue cg_builtin_map_info(cgProcedure *p, Type *map_type);
+gb_internal TB_Symbol *cg_map_info_symbol(cgModule *m, Type *map_type);
 gb_internal cgValue cg_builtin_map_cell_info(cgProcedure *p, Type *type);
 gb_internal cgValue cg_emit_source_code_location_as_global(cgProcedure *p, String const &proc_name, TokenPos pos);
 gb_internal cgValue cg_emit_source_code_location_as_global(cgProcedure *p, Ast *node);

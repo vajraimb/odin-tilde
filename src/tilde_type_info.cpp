@@ -327,6 +327,12 @@ gb_internal void cg_setup_type_info_data(cgModule *m) {
 		// NOTE(bill): Removes need for heap allocation by making it global memory
 		isize count = 0;
 		isize enum_count = 0;
+		// NOTE(odin-tilde): mirrors lb's offsets_extra — bit fields write
+		// BOTH bit_sizes and bit_offsets into the offsets buffer (two
+		// entries per field); without this the buffer was undersized and
+		// the exporter asserted "global region overflow" once any bit_field
+		// type reached type info (repro: odin test tests/core/fmt).
+		isize offsets_extra = 0;
 
 		for (auto const &tt : m->info->type_info_types_hash_map) {
 			Type *t = tt.type;
@@ -347,6 +353,15 @@ gb_internal void cg_setup_type_info_data(cgModule *m) {
 				break;
 			case Type_Tuple:
 				count += t->Tuple.variables.count;
+				break;
+			// NOTE(odin-tilde): BitField also consumes member types/names/
+			// offsets/tags entries (cg_set_type_info_member_* at the
+			// Type_BitField emit site) but was missing from this pre-count,
+			// overflowing __$type_info_types_data et al.
+			case Type_BitField:
+				count += t->BitField.fields.count;
+				// Twice is needed for the bit_offsets
+				offsets_extra += t->BitField.fields.count;
 				break;
 			case Type_Enum:
 				enum_count += t->Enum.fields.count;
@@ -370,9 +385,9 @@ gb_internal void cg_setup_type_info_data(cgModule *m) {
 		}
 		if (count > 0) {
 			char const *name = CG_TYPE_INFO_OFFSETS_NAME;
-			Type *t = alloc_type_array(t_uintptr, count);
+			Type *t = alloc_type_array(t_uintptr, count + offsets_extra);
 			TB_Global *g = tb_global_create(m->mod, -1, name, nullptr, TB_LINKAGE_PRIVATE);
-			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), g, type_size_of(t), 16, count);
+			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), g, type_size_of(t), 16, count + offsets_extra);
 			cg_global_type_info_member_offsets = GlobalTypeInfoData{g, t, t_uintptr, 0};
 		}
 
@@ -959,11 +974,16 @@ gb_internal void cg_setup_type_info_data(cgModule *m) {
 				i64 value_offset    = type_offset_of(tag_type, 1);
 				i64 map_info_offset = type_offset_of(tag_type, 2);
 
-				// TODO(bill): map info
-				gb_unused(map_info_offset);
-
 				cg_global_const_type_info_ptr(m, t->Map.key,   global, offset+key_offset);
 				cg_global_const_type_info_ptr(m, t->Map.value, global, offset+value_offset);
+
+				// NOTE(odin-tilde): write runtime.Map_Info (cell infos +
+				// hasher/equal procs) — without it Type_Info_Map.map_info is
+				// nil and fmt's map verbs (%v/%w) bail out printing an empty
+				// "{}" (repro: odin test core/fmt test_odin_value_export).
+				// Mirrors lb's lb_gen_map_info_ptr in the Type_Map case.
+				TB_Symbol *map_info = cg_map_info_symbol(m, t);
+				tb_global_add_symbol_reloc(m->mod, global, offset+map_info_offset, map_info);
 
 			}
 			break;
