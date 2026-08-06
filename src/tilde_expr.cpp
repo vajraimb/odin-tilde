@@ -2001,13 +2001,27 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 			return cg_emit_conv(p, res_f64, t);
 		}
 
-		bool is_signed = !is_type_unsigned(dst);
+		// PATCH(odin-tilde): signedness comes from the SOURCE integer (the old
+		// code tested dst, the float, making every conversion signed). And x86
+		// cvtsi2ss/sd reads a 32/64-bit register while sub-dword values are held
+		// zero-extended (the movzx invariant): signed i8/i16 must be
+		// sign-extended to 32 bits first (i8 -1 converted as 255.0), unsigned
+		// u8/u16/u32 are zero-extended to 64 bits so the signed cvt reads the
+		// full non-negative value (u32 4294967295 converted as -1.0).
+		bool is_signed = !is_type_unsigned(src);
+		TB_Node *src_node = value.node;
+		isize src_size = type_size_of(src);
+		if (is_signed && src_size < 4) {
+			src_node = tb_inst_sxt(p->func, src_node, TB_TYPE_I32);
+		} else if (!is_signed && src_size < 8) {
+			src_node = tb_inst_zxt(p->func, src_node, TB_TYPE_I64);
+		}
 		if (type_size_of(dst) == 2) {
 			// NOTE(odin-tilde): f16 is an I16 bit pattern, convert via f32
-			TB_Node *f32 = tb_inst_int2float(p->func, value.node, TB_TYPE_F32, is_signed);
+			TB_Node *f32 = tb_inst_int2float(p->func, src_node, TB_TYPE_F32, is_signed);
 			return cg_value(cg_tb_f32_to_f16_node(p->func, f32), t);
 		}
-		return cg_value(tb_inst_int2float(p->func, value.node, dt, is_signed), t);
+		return cg_value(tb_inst_int2float(p->func, src_node, dt, is_signed), t);
 	}
 
 	if (is_type_simd_vector(dst)) {

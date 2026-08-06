@@ -178,7 +178,47 @@ gb_internal void cg_write_uint_at_ptr(void *dst, u64 i, Type *original_type) {
 }
 
 gb_internal TB_Global *cg_global_const_string(cgModule *m, String const &str, Type *type, TB_Global *global, i64 offset) {
-	GB_ASSERT(is_type_string(type));
+	// NOTE(odin-tilde): a string constant may also be typed []u8 (constant
+	// `[]u8("...")` conversion, seen in compress) — a slice is layout
+	// identical to a string {ptr, len}, so it shares the 8-bit path below.
+	Type *bt_str = base_type(type);
+	bool is_u8_slice = bt_str->kind == Type_Slice && is_type_u8(core_type(bt_str->Slice.elem));
+	GB_ASSERT(is_type_string(type) || is_type_cstring(type) || is_type_string16(type) || is_type_cstring16(type) || is_u8_slice);
+
+	if (is_type_string16(type) || is_type_cstring16(type)) {
+		// NOTE(odin-tilde): mirrors the cg_const_value string16 path — backing
+		// bytes are UTF-16, then a reloc (cstring16) or reloc+len (string16).
+		TEMPORARY_ALLOCATOR_GUARD();
+		String16 s16 = string_to_string16(temporary_allocator(), str);
+
+		String name = cg_generated_name(m, nullptr, "csb16");
+		TB_Global *str_global = tb_global_create(m->mod, name.len, cast(char const *)name.text, nullptr, TB_LINKAGE_PRIVATE);
+		i64 size = (s16.len+1)*2;
+		tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), str_global, size, 2, 1);
+		u8 *data = cast(u8 *)tb_global_add_region(m->mod, str_global, 0, size);
+		gb_memcopy(data, s16.text, s16.len*2);
+		data[s16.len*2+0] = 0;
+		data[s16.len*2+1] = 0;
+
+		if (is_type_cstring16(type)) {
+			if (global) {
+				tb_global_add_symbol_reloc(m->mod, global, offset+0, cast(TB_Symbol *)str_global);
+			}
+			return str_global;
+		}
+
+		if (global == nullptr) {
+			String cstr_name = cg_generated_name(m, nullptr, "cstr16");
+			global = tb_global_create(m->mod, cstr_name.len, cast(char const *)cstr_name.text, cg_debug_type(m, type), TB_LINKAGE_PRIVATE);
+			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), global, type_size_of(type), type_align_of(type), 2);
+		}
+
+		tb_global_add_symbol_reloc(m->mod, global, offset+0, cast(TB_Symbol *)str_global);
+		void *len_ptr = tb_global_add_region(m->mod, global, offset+build_context.int_size, build_context.int_size);
+		cg_write_int_at_ptr(len_ptr, s16.len, t_int);
+
+		return global;
+	}
 
 	String name = cg_generated_name(m, nullptr, "csb");
 	TB_Global *str_global = tb_global_create(m->mod, name.len, cast(char const *)name.text, nullptr, TB_LINKAGE_PRIVATE);
@@ -441,7 +481,11 @@ gb_internal isize cg_global_const_calculate_region_count(ExactValue const &value
 					if (tav.mode != Addressing_Invalid) {
 						value = tav.value;
 					}
-					count += cg_global_const_calculate_region_count(value, type);
+					// PATCH(odin-tilde): count against the field's type, not
+					// the struct's — a nested compound elem recursing with the
+					// outer struct type indexes its own elems against the outer
+					// fields array and overruns it (compress hit this).
+					count += cg_global_const_calculate_region_count(value, f->type);
 				}
 			}
 			break;

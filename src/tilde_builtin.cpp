@@ -37,6 +37,13 @@ gb_internal cgValue cg_builtin_len(cgProcedure *p, cgValue value) {
 				args[0] = value;
 				return cg_emit_runtime_call(p, "cstring_len", args);
 			}
+		case Basic_cstring16:
+			{
+				// NOTE(odin-tilde): mirrors the cstring path — runtime call.
+				auto args = slice_make<cgValue>(permanent_allocator(), 1);
+				args[0] = value;
+				return cg_emit_runtime_call(p, "cstring16_len", args);
+			}
 		}
 		break;
 	case Type_Array:
