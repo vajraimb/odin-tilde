@@ -549,15 +549,23 @@ i31_muladd_small :: proc "contextless" (x: []u32, z: u32, m: []u32) {
 	//    u-2 <= q <= u
 	hi = x[mlen]
 	a0, a1, b0: u32
+	// Note: The word shift below cannot use intrinsics.mem_copy, as the
+	// source and destination ranges overlap (dst == src + 1 word), and
+	// overlapping memcpy is UB (BearSSL uses memmove here).  A plain
+	// backwards element loop has well-defined behavior on all backends.
 	if mblr == 0 {
 		a0 = x[mlen]
-		intrinsics.mem_copy(raw_data(x[2:]), raw_data(x[1:]), (mlen - 1) * size_of(u32))
+		for i := mlen; i >= 2; i -= 1 {
+			x[i] = x[i - 1]
+		}
 		x[1] = z
 		a1 = x[mlen]
 		b0 = m[mlen]
 	} else {
 		a0 = ((x[mlen] << (31 - mblr)) | (x[mlen - 1] >> mblr)) & I31_MASK
-		intrinsics.mem_copy(raw_data(x[2:]), raw_data(x[1:]), (mlen - 1) * size_of(u32))
+		for i := mlen; i >= 2; i -= 1 {
+			x[i] = x[i - 1]
+		}
 		x[1] = z
 		a1 = ((x[mlen] << (31 - mblr)) | (x[mlen - 1] >> mblr)) & I31_MASK
 		b0 = ((m[mlen] << (31 - mblr)) | (m[mlen - 1] >> mblr)) & I31_MASK

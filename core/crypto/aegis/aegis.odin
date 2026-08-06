@@ -106,21 +106,26 @@ seal :: proc(ctx: ^Context, dst, tag, iv, aad, plaintext: []byte) {
 
 	switch ctx._impl {
 	case .Hardware:
-		st: State_HW
-		defer reset_state_hw(&st)
+		// NOTE(odin-tilde): unreachable under tilde — init forces .Portable
+		// since is_hardware_accelerated is false; keep the hw procs
+		// unreferenced so the LLVM-intrinsic foreign symbols stay out.
+		when !ODIN_TILDE {
+			st: State_HW
+			defer reset_state_hw(&st)
 
-		init_hw(ctx, &st, iv)
+			init_hw(ctx, &st, iv)
 
-		aad_len, pt_len := len(aad), len(plaintext)
-		if aad_len > 0 {
-			absorb_hw(&st, aad)
+			aad_len, pt_len := len(aad), len(plaintext)
+			if aad_len > 0 {
+				absorb_hw(&st, aad)
+			}
+
+			if pt_len > 0 {
+				enc_hw(&st, dst, plaintext)
+			}
+
+			finalize_hw(&st, tag, aad_len, pt_len)
 		}
-
-		if pt_len > 0 {
-			enc_hw(&st, dst, plaintext)
-		}
-
-		finalize_hw(&st, tag, aad_len, pt_len)
 	case .Portable:
 		st: State_SW
 		defer reset_state_sw(&st)
@@ -162,20 +167,23 @@ open :: proc(ctx: ^Context, dst, iv, aad, ciphertext, tag: []byte) -> bool {
 
 	switch ctx._impl {
 	case .Hardware:
-		st: State_HW
-		defer reset_state_hw(&st)
+		// NOTE(odin-tilde): unreachable under tilde — see seal.
+		when !ODIN_TILDE {
+			st: State_HW
+			defer reset_state_hw(&st)
 
-		init_hw(ctx, &st, iv)
+			init_hw(ctx, &st, iv)
 
-		if aad_len > 0 {
-			absorb_hw(&st, aad)
+			if aad_len > 0 {
+				absorb_hw(&st, aad)
+			}
+
+			if ct_len > 0 {
+				dec_hw(&st, dst, ciphertext)
+			}
+
+			finalize_hw(&st, derived_tag, aad_len, ct_len)
 		}
-
-		if ct_len > 0 {
-			dec_hw(&st, dst, ciphertext)
-		}
-
-		finalize_hw(&st, derived_tag, aad_len, ct_len)
 	case .Portable:
 		st: State_SW
 		defer reset_state_sw(&st)

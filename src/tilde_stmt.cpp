@@ -623,6 +623,12 @@ gb_internal cgValue cg_emit_ptr_offset(cgProcedure *p, cgValue ptr, cgValue inde
 	GB_ASSERT(is_type_pointer(ptr.type) || is_type_multi_pointer(ptr.type));
 	GB_ASSERT(is_type_integer(index.type));
 
+	// NOTE(odin-tilde): tb_builder_ptr_array multiplies the index by an I64
+	// stride constant, so a non-int-width index (e.g. a u32 slice bound in
+	// _bigint) trips TB's datatype-mismatch assert. Normalize to t_int.
+	index = cg_emit_conv(p, index, t_int);
+	GB_ASSERT(index.kind == cgValue_Value);
+
 	Type *elem = type_deref(ptr.type, true);
 	i64 stride = type_size_of(elem);
 	GB_ASSERT_MSG(ptr.node->dt.type == TB_TAG_PTR, "ptr_offset base not PTR: %s dt=%d node=%d (in %.*s)", type_to_string(ptr.type), cast(int)ptr.node->dt.type, cast(int)ptr.node->type, LIT(p->name));

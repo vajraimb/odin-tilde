@@ -123,9 +123,13 @@ reset_ctr :: proc "contextless" (ctx: ^Context_CTR) {
 @(private = "file")
 ctr_blocks :: proc(ctx: ^Context_CTR, dst, src: []byte, nr_blocks: int) #no_bounds_check {
 	// Use the optimized hardware implementation if available.
-	if _, is_hw := ctx._impl.(Context_Impl_Hardware); is_hw {
-		ctr_blocks_hw(ctx, dst, src, nr_blocks)
-		return
+	// NOTE(odin-tilde): unreachable under tilde; keep the hw procs
+	// unreferenced so the LLVM-intrinsic foreign symbols stay out.
+	when !ODIN_TILDE {
+		if _, is_hw := ctx._impl.(Context_Impl_Hardware); is_hw {
+			ctr_blocks_hw(ctx, dst, src, nr_blocks)
+			return
+		}
 	}
 
 	// Portable implementation.

@@ -5,7 +5,11 @@ package aes_hw
 // is_supported returns true if and only if (⟺) hardware accelerated AES
 // is supported.
 is_supported :: proc "contextless" () -> bool {
-	when ODIN_ARCH == .amd64 {
+	// NOTE(odin-tilde): the tilde backend cannot emit the LLVM-specific
+	// AES-NI intrinsics, so hardware AES is never available under it.
+	when ODIN_TILDE {
+		return false
+	} else when ODIN_ARCH == .amd64 {
 		// Note: Everything with AES-NI has support for
 		// the required SSE extxtensions.
 		req_features :: info.CPU_Features{

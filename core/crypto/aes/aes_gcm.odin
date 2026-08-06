@@ -46,9 +46,13 @@ seal_gcm :: proc(ctx: ^Context_GCM, dst, tag, iv, aad, plaintext: []byte) {
 	ensure(len(dst) == len(plaintext), "crypto/aes: invalid destination ciphertext size")
 	ensure(!bytes.alias_inexactly(dst, plaintext), "crypto/aes: dst and plaintext alias inexactly")
 
-	if impl, is_hw := ctx._impl.(Context_Impl_Hardware); is_hw {
-		gcm_seal_hw(&impl, dst, tag, iv, aad, plaintext)
-		return
+	// NOTE(odin-tilde): unreachable under tilde; keep the hw procs
+	// unreferenced so the LLVM-intrinsic foreign symbols stay out.
+	when !ODIN_TILDE {
+		if impl, is_hw := ctx._impl.(Context_Impl_Hardware); is_hw {
+			gcm_seal_hw(&impl, dst, tag, iv, aad, plaintext)
+			return
+		}
 	}
 
 	h: [_aes.GHASH_KEY_SIZE]byte
@@ -82,8 +86,12 @@ open_gcm :: proc(ctx: ^Context_GCM, dst, iv, aad, ciphertext, tag: []byte) -> bo
 	ensure(len(dst) == len(ciphertext), "crypto/aes: invalid destination plaintext size")
 	ensure(!bytes.alias_inexactly(dst, ciphertext), "crypto/aes: dst and ciphertext alias inexactly")
 
-	if impl, is_hw := ctx._impl.(Context_Impl_Hardware); is_hw {
-		return gcm_open_hw(&impl, dst, iv, aad, ciphertext, tag)
+	// NOTE(odin-tilde): unreachable under tilde; keep the hw procs
+	// unreferenced so the LLVM-intrinsic foreign symbols stay out.
+	when !ODIN_TILDE {
+		if impl, is_hw := ctx._impl.(Context_Impl_Hardware); is_hw {
+			return gcm_open_hw(&impl, dst, iv, aad, ciphertext, tag)
+		}
 	}
 
 	h: [_aes.GHASH_KEY_SIZE]byte

@@ -135,6 +135,12 @@ init :: proc "contextless" (ctx: ^Context) {
 	ctx.rsiz = 200 - 2 * ctx.mdlen
 	ctx.pt = 0
 
+	// keccak_round_start must be zeroed here: Context is frequently
+	// declared with `---` (uninitialized) by callers, and leaving this
+	// field holding stack garbage trips the validity ensure in
+	// keccak_permute.  turboshake overrides it to 12 after init.
+	ctx.keccak_round_start = 0
+
 	ctx.is_initialized = true
 	ctx.is_finalized = false
 }

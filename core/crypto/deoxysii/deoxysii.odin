@@ -114,7 +114,12 @@ seal :: proc(ctx: ^Context, dst, tag, iv, aad, plaintext: []byte) {
 
 	switch ctx._impl {
 	case .Hardware:
-		e_hw(ctx, dst, tag, iv, aad, plaintext)
+		// NOTE(odin-tilde): unreachable under tilde — init forces .Portable
+		// since is_hardware_accelerated is false; keep the hw procs
+		// unreferenced so the LLVM-intrinsic foreign symbols stay out.
+		when !ODIN_TILDE {
+			e_hw(ctx, dst, tag, iv, aad, plaintext)
+		}
 	case .Portable:
 		e_ref(ctx, dst, tag, iv, aad, plaintext)
 	}
@@ -137,7 +142,10 @@ open :: proc(ctx: ^Context, dst, iv, aad, ciphertext, tag: []byte) -> bool {
 	ok: bool
 	switch ctx._impl {
 	case .Hardware:
-		ok = d_hw(ctx, dst, iv, aad, ciphertext, tag)
+		// NOTE(odin-tilde): unreachable under tilde — see seal.
+		when !ODIN_TILDE {
+			ok = d_hw(ctx, dst, iv, aad, ciphertext, tag)
+		}
 	case .Portable:
 		ok = d_ref(ctx, dst, iv, aad, ciphertext, tag)
 	}

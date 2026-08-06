@@ -23,11 +23,17 @@ encrypt_ecb :: proc(ctx: ^Context_ECB, dst, src: []byte) {
 	ensure(len(dst) == BLOCK_SIZE, "crypto/aes: invalid dst size")
 	ensure(len(src) == BLOCK_SIZE, "crypto/aes: invalid src size")
 
-	switch &impl in ctx._impl {
-	case ct64.Context:
-		ct64.encrypt_block(&impl, dst, src)
-	case Context_Impl_Hardware:
-		encrypt_block_hw(&impl, dst, src)
+	// NOTE(odin-tilde): the hw case is unreachable under tilde; keep the hw
+	// procs unreferenced so the LLVM-intrinsic foreign symbols stay out.
+	when ODIN_TILDE {
+		ct64.encrypt_block(&ctx._impl.(ct64.Context), dst, src)
+	} else {
+		switch &impl in ctx._impl {
+		case ct64.Context:
+			ct64.encrypt_block(&impl, dst, src)
+		case Context_Impl_Hardware:
+			encrypt_block_hw(&impl, dst, src)
+		}
 	}
 }
 
@@ -37,11 +43,15 @@ decrypt_ecb :: proc(ctx: ^Context_ECB, dst, src: []byte) {
 	ensure(len(dst) == BLOCK_SIZE, "crypto/aes: invalid dst size")
 	ensure(len(src) == BLOCK_SIZE, "crypto/aes: invalid src size")
 
-	switch &impl in ctx._impl {
-	case ct64.Context:
-		ct64.decrypt_block(&impl, dst, src)
-	case Context_Impl_Hardware:
-		decrypt_block_hw(&impl, dst, src)
+	when ODIN_TILDE {
+		ct64.decrypt_block(&ctx._impl.(ct64.Context), dst, src)
+	} else {
+		switch &impl in ctx._impl {
+		case ct64.Context:
+			ct64.decrypt_block(&impl, dst, src)
+		case Context_Impl_Hardware:
+			decrypt_block_hw(&impl, dst, src)
+		}
 	}
 }
 

@@ -36,8 +36,16 @@ init_impl :: proc(ctx: ^Context_Impl, key: []byte, impl: Implementation) {
 		reflect.set_union_variant_typeid(ctx^, typeid_of(ct64.Context))
 		ct64.init(&ctx.(ct64.Context), key)
 	case .Hardware:
-		reflect.set_union_variant_typeid(ctx^, typeid_of(Context_Impl_Hardware))
-		init_impl_hw(&ctx.(Context_Impl_Hardware), key)
+		// NOTE(odin-tilde): unreachable under tilde (is_hardware_accelerated
+		// is false); keep the hw procs unreferenced so the LLVM-intrinsic
+		// foreign symbols are never pulled in.
+		when ODIN_TILDE {
+			reflect.set_union_variant_typeid(ctx^, typeid_of(ct64.Context))
+			ct64.init(&ctx.(ct64.Context), key)
+		} else {
+			reflect.set_union_variant_typeid(ctx^, typeid_of(Context_Impl_Hardware))
+			init_impl_hw(&ctx.(Context_Impl_Hardware), key)
+		}
 	}
 }
 

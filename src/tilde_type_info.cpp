@@ -885,6 +885,12 @@ gb_internal void cg_setup_type_info_data(cgModule *m) {
 
 				i64 count = t->Struct.fields.count;
 
+				// NOTE(odin-tilde): offsets are computed lazily; a struct type
+				// whose layout was never queried (only used behind pointers)
+				// has Struct.offsets == nullptr (crypto hit this, null deref).
+				// Mirrors lb's "just in case" type_set_offsets calls.
+				type_set_offsets(t);
+
 				cg_set_type_info_member_types(m, global, offset+types_offset, count, t, [](isize i, void *userdata) -> Type * {
 					Type *t = cast(Type *)userdata;
 					return t->Struct.fields[i]->type;
