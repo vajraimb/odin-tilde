@@ -371,13 +371,17 @@ gb_internal void cg_emit_store_union_variant(cgProcedure *p, cgValue parent_ptr,
 
 
 
+gb_internal cgValue cg_emit_byte_swap(cgProcedure *p, cgValue value, Type *end_type);
+
 gb_internal cgValue cg_correct_endianness(cgProcedure *p, cgValue value) {
 	Type *src = core_type(value.type);
 	GB_ASSERT(is_type_integer(src) || is_type_float(src));
 	if (is_type_different_to_arch_endianness(src)) {
-		GB_PANIC("TODO(bill): cg_correct_endianness");
-		// Type *platform_src_type = integer_endian_type_to_platform_type(src);
-		// value = cg_emit_byte_swap(p, value, platform_src_type);
+		// NOTE(odin-tilde): mirrors lb_correct_endianness — normalize a
+		// foreign-endian scalar (e.g. u32be slice indices in timezone
+		// parsing) to the platform type before use.
+		Type *platform_src_type = integer_endian_type_to_platform_type(src);
+		value = cg_emit_byte_swap(p, value, platform_src_type);
 	}
 	return value;
 }

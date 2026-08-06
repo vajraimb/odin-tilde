@@ -1,3 +1,13 @@
+// Host-side byte swap of the low `size` bytes of v (for foreign-endian
+// immediate constants; see the emission site below).
+gb_internal u64 cg_host_bswap(u64 v, i64 size) {
+	u64 r = 0;
+	for (i64 i = 0; i < size; i++) {
+		r = (r << 8) | ((v >> (8*i)) & 0xff);
+	}
+	return r;
+}
+
 gb_internal bool cg_is_expr_constant_zero(Ast *expr) {
 	GB_ASSERT(expr != nullptr);
 	auto v = exact_value_to_integer(expr->tav.value);
@@ -1172,9 +1182,22 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 			} else {
 				i = exact_value_to_u64(value);
 			}
+			if (is_type_different_to_arch_endianness(type)) {
+				// NOTE(odin-tilde): foreign-endian scalars live in registers
+				// in byte-swapped form (a raw load of BE memory already yields
+				// the swapped representation), so an immediate constant must
+				// be emitted swapped as well — otherwise e.g. the TZif magic
+				// check `v1_hdr.magic != u32be(0x545A6966)` compares a swapped
+				// load against an unswapped constant and always fires.
+				i = cg_host_bswap(i, type_size_of(type));
+			}
 			return cg_value(tb_inst_uint(p->func, dt, i), type);
 		} else {
 			i64 i = exact_value_to_i64(value);
+			if (is_type_different_to_arch_endianness(type)) {
+				// see note above
+				i = cast(i64)cg_host_bswap(cast(u64)i, type_size_of(type));
+			}
 			return cg_value(tb_inst_sint(p->func, dt, i), type);
 		}
 		break;
