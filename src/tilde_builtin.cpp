@@ -483,6 +483,37 @@ gb_internal TB_Node *cg_simd_load_lane(cgProcedure *p, cgValue base_ptr, Type *e
 	return tb_inst_load(p->func, edt, ep.node, align, false);
 }
 
+// PATCH(odin-tilde): scalarized #simd binary operators (+ - * / % %% & | ^ &~ << >>).
+// Same model as the intrinsics below: vectors live in memory, each lane is
+// computed with the scalar cg_emit_arith (which also covers f16 promotion and
+// shift semantics). The RHS lane keeps its own element type for shifts.
+gb_internal cgValue cg_emit_arith_simd(cgProcedure *p, TokenKind op, cgValue lhs, cgValue rhs, Type *type) {
+	Type *bt = base_type(type);
+	GB_ASSERT_MSG(bt->kind == Type_SimdVector, "%s", type_to_string(type));
+	Type *et = bt->SimdVector.elem;
+	i64 count = bt->SimdVector.count;
+
+	lhs = cg_emit_conv(p, lhs, type);
+	rhs = cg_emit_conv(p, rhs, type);
+
+	Type *rt = nullptr;
+	cgValue xb = cg_simd_base_ptr(p, lhs, nullptr, nullptr);
+	cgValue yb = cg_simd_base_ptr(p, rhs, &rt, nullptr);
+
+	cgAddr res = cg_add_local(p, type, nullptr, true);
+	cgValue rb = cg_value(cg_addr_get_ptr(p, res).node, alloc_type_pointer(et));
+
+	for (i64 i = 0; i < count; i++) {
+		TB_Node *idx = tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)i);
+		TB_Node *a = cg_simd_load_lane(p, xb, et, idx);
+		TB_Node *b = cg_simd_load_lane(p, yb, rt, idx);
+		cgValue v = cg_emit_arith(p, op, cg_value(a, et), cg_value(b, rt), et);
+		cgValue ep = cg_emit_ptr_offset(p, rb, cg_const_int(p, t_int, i));
+		cg_emit_store(p, ep, v);
+	}
+	return cg_addr_load(p, res);
+}
+
 gb_internal cgValue cg_build_builtin_simd_proc(cgProcedure *p, Ast *expr, BuiltinProcId id) {
 	ast_node(ce, CallExpr, expr);
 	Type *result_type = type_and_value_of_expr(expr).type;
@@ -1046,13 +1077,30 @@ gb_internal cgValue cg_build_builtin(cgProcedure *p, BuiltinProcId id, Ast *expr
 
 	case BuiltinProc_swizzle: {
 		// NOTE(odin-tilde): fixed-array swizzle; materialize the source
-		// and copy elements one by one into a result local. SIMD-vector
-		// swizzle is still unimplemented (KNOWN_ISSUES.md).
-		if (is_type_simd_vector(type_of_expr(expr))) {
-			GB_PANIC("TODO(bill): builtin procs %d %.*s (simd)", id, LIT(builtin_name));
-		}
+		// and copy elements one by one into a result local.
 		Type *t = type_of_expr(expr);
 		cgValue arr = cg_build_expr(p, ce->args[0]);
+		if (is_type_simd_vector(arr.type)) {
+			// NOTE(odin-tilde): scalarized #simd swizzle — indices are
+			// compile-time constants (checker-enforced, >= 2, power of two),
+			// so this is a fixed lane gather.
+			Type *et = nullptr;
+			cgValue xb = cg_simd_base_ptr(p, arr, &et, nullptr);
+			Type *rt = base_type(t);
+			GB_ASSERT(rt->kind == Type_SimdVector);
+			Type *rt_et = rt->SimdVector.elem;
+			cgAddr dst_addr = cg_add_local(p, t, nullptr, false);
+			cgValue dst = cg_value(cg_addr_get_ptr(p, dst_addr).node, alloc_type_pointer(rt_et));
+			for (isize i = 1; i < ce->args.count; i++) {
+				TypeAndValue itav = type_and_value_of_expr(ce->args[i]);
+				GB_ASSERT(itav.value.kind == ExactValue_Integer);
+				i64 index = exact_value_to_i64(itav.value);
+				TB_Node *lane = cg_simd_load_lane(p, xb, et, tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)index));
+				cgValue ep = cg_emit_ptr_offset(p, dst, cg_const_int(p, t_int, i-1));
+				cg_emit_store(p, ep, cg_value(lane, et));
+			}
+			return cg_addr_load(p, dst_addr);
+		}
 		cgValue arr_ptr = cg_address_from_load_or_generate_local(p, arr);
 		cgAddr dst_addr = cg_add_local(p, t, nullptr, false);
 		cgValue dst = cg_addr_get_ptr(p, dst_addr);

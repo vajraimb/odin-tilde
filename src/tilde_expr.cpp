@@ -2015,16 +2015,33 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 		// so a scalar -> vector conversion replicates the scalar into every
 		// lane of a temporary local
 		if (is_type_simd_vector(src)) {
-			// PATCH(odin-tilde): vector -> vector is a pure bitcast (mirrors
-			// lb_emit_conv); copy the bytes into a dst-typed temporary
-			GB_ASSERT_MSG(type_size_of(src) == type_size_of(dst),
+			// PATCH(odin-tilde): vector -> vector (mirrors lb_emit_conv):
+			// lane counts must match; identical element types are a no-op,
+			// otherwise each lane goes through the scalar cg_emit_conv
+			// (IntCast2/FPCast/FPToUI equivalents). A pure bitcast is only
+			// valid for identical element types — same-width int<->float is
+			// a numeric conversion, not a bitcast.
+			Type *src_bt = base_type(src);
+			Type *dst_bt = base_type(dst);
+			Type *src_et = src_bt->SimdVector.elem;
+			Type *dst_et = dst_bt->SimdVector.elem;
+			i64 count = dst_bt->SimdVector.count;
+			GB_ASSERT_MSG(src_bt->SimdVector.count == count,
 			              "%s -> %s (in %.*s)", type_to_string(src), type_to_string(dst), LIT(p->name));
+			if (are_types_identical(src_et, dst_et)) {
+				value.type = dst;
+				return value;
+			}
 			cgValue sa = cg_address_from_load_or_generate_local(p, value);
+			cgValue sp = cg_value(sa.node, alloc_type_pointer(src_et));
 			cgAddr tmp = cg_add_local(p, dst, nullptr, false);
-			cgValue dp = cg_addr_get_ptr(p, tmp);
-			tb_inst_memcpy(p->func, dp.node, sa.node,
-			               tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)type_size_of(dst)),
-			               cast(TB_CharUnits)type_align_of(dst));
+			cgValue dp = cg_value(cg_addr_get_ptr(p, tmp).node, alloc_type_pointer(dst_et));
+			for (i64 i = 0; i < count; i++) {
+				cgValue idx = cg_const_int(p, t_int, i);
+				cgValue a = cg_emit_load(p, cg_emit_ptr_offset(p, sp, idx));
+				cgValue b = cg_emit_conv(p, a, dst_et);
+				cg_emit_store(p, cg_emit_ptr_offset(p, dp, idx), b);
+			}
 			return cg_addr_load(p, tmp);
 		}
 		GB_ASSERT_MSG(!is_type_simd_vector(src), "%s -> #simd vector (in %.*s)", type_to_string(src), LIT(p->name));
@@ -2548,6 +2565,12 @@ gb_internal cgValue cg_emit_arith(cgProcedure *p, TokenKind op, cgValue lhs, cgV
 	if (cg_is_type_integer_128(type)) {
 		// NOTE(odin-tilde): 128-bit integers are memory aggregates here
 		return cg_emit_arith_u128(p, op, lhs, rhs, type);
+	}
+
+	if (is_type_simd_vector(type)) {
+		// NOTE(odin-tilde): #simd vectors are memory aggregates; per-lane
+		// scalarization lives in tilde_builtin.cpp with the simd intrinsics
+		return cg_emit_arith_simd(p, op, lhs, rhs, type);
 	}
 
 	lhs = cg_flatten_value(p, cg_emit_conv(p, lhs, type));
@@ -4375,24 +4398,20 @@ cgAddr cg_build_addr_compound_lit(cgProcedure *p, Ast *expr) {
 	}
 
 	case Type_SimdVector: {
-		// auto temp_data = array_make<cgCompoundLitElemTempData>(temporary_allocator(), 0, cl->elems.count);
+		// NOTE(odin-tilde): vectors live in memory as flat element arrays in
+		// this backend, so a #simd compound literal lowers exactly like the
+		// Type_Array case (populate + per-element stores).
+		auto temp_data = array_make<cgCompoundLitElemTempData>(temporary_allocator(), 0, cl->elems.count);
 
-		// populate(p, cl->elems, &temp_data, type);
+		populate(p, cl->elems, &temp_data, type);
 
-		// // TODO(bill): reduce the need for individual `insertelement` if a `shufflevector`
-		// // might be a better option
-		// for (auto const &td : temp_data) if (td.value.node != nullptr) {
-		// 	if (td.elem_length > 0) {
-		// 		for (i64 k = 0; k < td.elem_length; k++) {
-		// 			LLVMValueRef index = cg_const_int(p->module, t_u32, td.elem_index + k).value;
-		// 			vector_value.value = LLVMBuildInsertElement(p->builder, vector_value.value, td.value.value, index, "");
-		// 		}
-		// 	} else {
-		// 		LLVMValueRef index = cg_const_int(p->module, t_u32, td.elem_index).value;
-		// 		vector_value.value = LLVMBuildInsertElement(p->builder, vector_value.value, td.value.value, index, "");
+		cgValue dst_ptr = cg_addr_get_ptr(p, v);
+		for_array(i, temp_data) {
+			i32 index = cast(i32)(temp_data[i].elem_index);
+			temp_data[i].gep = cg_emit_array_epi(p, dst_ptr, index);
+		}
 
-		// 	}
-		// }
+		assign_array(p, temp_data);
 		break;
 	}
 	}

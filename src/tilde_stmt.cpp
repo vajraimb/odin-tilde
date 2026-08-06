@@ -636,7 +636,7 @@ gb_internal cgValue cg_emit_array_ep(cgProcedure *p, cgValue s, cgValue index) {
 	Type *t = s.type;
 	GB_ASSERT_MSG(is_type_pointer(t), "%s", type_to_string(t));
 	Type *st = base_type(type_deref(t));
-	GB_ASSERT_MSG(is_type_array(st) || is_type_enumerated_array(st) || is_type_matrix(st), "%s", type_to_string(st));
+	GB_ASSERT_MSG(is_type_array(st) || is_type_enumerated_array(st) || is_type_matrix(st) || is_type_simd_vector(st), "%s", type_to_string(st));
 	GB_ASSERT_MSG(is_type_integer(core_type(index.type)), "%s", type_to_string(index.type));
 
 

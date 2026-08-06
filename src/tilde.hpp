@@ -440,6 +440,7 @@ gb_internal void     cg_emit_u128_limb_store(cgProcedure *p, TB_Node *base_ptr, 
 gb_internal TB_Node *cg_u128_addr_of(cgProcedure *p, cgValue v);
 gb_internal cgValue  cg_u128_make_value(cgProcedure *p, Type *type, bool swapped, TB_Node *lo, TB_Node *hi);
 gb_internal cgValue  cg_emit_arith_u128(cgProcedure *p, TokenKind op, cgValue lhs, cgValue rhs, Type *type);
+gb_internal cgValue  cg_emit_arith_simd(cgProcedure *p, TokenKind op, cgValue lhs, cgValue rhs, Type *type);
 gb_internal cgValue  cg_emit_comp_u128(cgProcedure *p, TokenKind op_kind, cgValue left, cgValue right);
 gb_internal cgValue  cg_emit_conv_int128(cgProcedure *p, cgValue value, Type *src, Type *dst, Type *t);
 gb_internal void    cg_emit_increment(cgProcedure *p, cgValue addr);
