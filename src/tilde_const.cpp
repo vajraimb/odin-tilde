@@ -660,18 +660,40 @@ gb_internal bool cg_global_const_add_region(cgModule *m, ExactValue const &value
 	} else if (is_type_matrix(type) &&
 		value.kind != ExactValue_Invalid &&
 		value.kind != ExactValue_Compound) {
-		GB_PANIC("TODO(bill): matrices");
-
+		// NOTE(odin-tilde): scalar x identity diagonal spread, mirroring
+		// lb_const_value; the integer constant is converted to the element
+		// float type before writing. Everything goes into ONE region —
+		// per-element regions would overflow TB_Global's object capacity
+		// (a 4x4 matrix alone would need 20 objects).
 		i64 row = bt->Matrix.row_count;
 		i64 column = bt->Matrix.column_count;
 		GB_ASSERT(row == column);
 
 		Type *elem = bt->Matrix.elem;
-
 		i64 elem_size = type_size_of(elem);
-		gb_unused(elem_size);
 
-		// 1 region in memory, not many
+		ExactValue elem_value = value;
+		if (value.kind == ExactValue_Integer && is_type_float(elem)) {
+			elem_value = exact_value_float(big_int_to_f64(&value.value_integer));
+		}
+
+		u8 *dst = cast(u8 *)tb_global_add_region(m->mod, global, offset, size);
+		gb_memset(dst, 0, size);
+		for (i64 i = 0; i < row; i++) {
+			i64 off = matrix_indices_to_offset(bt, i, i);
+			void *res = dst + off*elem_size;
+			if (elem_value.kind == ExactValue_Float) {
+				f64 f = exact_value_to_f64(elem_value);
+				switch (elem_size) {
+				case 2: *(u16 *)res = f32_to_f16(cast(f32)f); break;
+				case 4: *(f32 *)res = cast(f32)f;             break;
+				case 8: *(f64 *)res = cast(f64)f;             break;
+				}
+			} else {
+				GB_ASSERT(elem_value.kind == ExactValue_Integer);
+				cg_write_big_int_at_ptr(res, &elem_value.value_integer, elem);
+			}
+		}
 
 		return true;
 	} else if (is_type_simd_vector(type) &&
@@ -1112,6 +1134,28 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 		cgValue base = cg_value(cg_addr_get_ptr(p, tmp).node, alloc_type_pointer(et));
 		for (i64 i = 0; i < count; i++) {
 			cgValue ep = cg_emit_ptr_offset(p, base, cg_value(tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)i), t_int));
+			cg_emit_store(p, ep, ev);
+		}
+		return cg_addr_load(p, tmp);
+	}
+
+	// PATCH(odin-tilde): scalar constant of matrix type — diagonal spread
+	// (scalar x identity), mirroring lb_const_value; e.g. `mat = 1` in
+	// tests/core/encoding/cbor.
+	if (is_type_matrix(type) &&
+	    value.kind != ExactValue_Invalid &&
+	    value.kind != ExactValue_Compound) {
+		Type *bt = base_type(type);
+		i64 row = bt->Matrix.row_count;
+		i64 column = bt->Matrix.column_count;
+		GB_ASSERT(row == column);
+		Type *et = bt->Matrix.elem;
+		cgValue ev = cg_const_value(p, et, value);
+		cgAddr tmp = cg_add_local(p, type, nullptr, true);
+		cgValue base = cg_value(cg_addr_get_ptr(p, tmp).node, alloc_type_pointer(et));
+		for (i64 i = 0; i < row; i++) {
+			i64 off = matrix_indices_to_offset(type, i, i);
+			cgValue ep = cg_emit_ptr_offset(p, base, cg_value(tb_inst_uint(p->func, TB_TYPE_INT, cast(u64)off), t_int));
 			cg_emit_store(p, ep, ev);
 		}
 		return cg_addr_load(p, tmp);

@@ -2737,13 +2737,36 @@ gb_internal void cg_build_switch_stmt(cgProcedure *p, Ast *node) {
 
 	auto body_regions = slice_make<TB_Node *>(permanent_allocator(), body->stmts.count);
 	auto body_scopes = slice_make<Scope *>(permanent_allocator(), body->stmts.count);
+
+	// NOTE(new-tb): the default clause body is emitted LAST (after the case
+	// loop), so its fallthrough edge arrives at the next clause's body region
+	// AFTER that body has already been emitted. A lazy label cannot accept
+	// such a late edge (its slots were overwritten by the body's own stores,
+	// and no phi would retro-apply to already-emitted nodes), so the default
+	// clause's textual successor must be a pre-phi'd loop-style region whose
+	// clone keeps the shared phis branchable (same pattern as loop headers).
+	isize default_clause_index = -1;
+	for_array(i, body->stmts) {
+		ast_node(cc, CaseClause, body->stmts[i]);
+		if (cc->list.count == 0) {
+			default_clause_index = i;
+			break;
+		}
+	}
+
 	for_array(i, body->stmts) {
 		Ast *clause = body->stmts[i];
 		ast_node(cc, CaseClause, clause);
 
-		body_regions[i] = cg_control_region(p, cc->list.count == 0 ? "switch_default_body" : "switch_case_body");
+		bool is_default = cc->list.count == 0;
+		bool late_default_fall_target = default_clause_index >= 0 && i == default_clause_index+1;
+		if (late_default_fall_target) {
+			body_regions[i] = cg_control_region_loop(p, "switch_case_body_late");
+		} else {
+			body_regions[i] = cg_control_region(p, is_default ? "switch_default_body" : "switch_case_body");
+		}
 		body_scopes[i] = cc->scope;
-		if (cc->list.count == 0) {
+		if (is_default) {
 			default_block = body_regions[i];
 			default_scope = cc->scope;
 		}
@@ -3233,8 +3256,14 @@ gb_internal void cg_build_mutable_value_decl(cgProcedure *p, Ast *node) {
 			bool zero_init = vd->values.count == 0;
 			if (vd->names.count == vd->values.count) {
 				Ast *expr = unparen_expr(vd->values[i]);
+				// NOTE(odin-tilde): the address-reuse shortcut is only valid
+				// when no conversion stands between the literal and the
+				// declared type — e.g. `u: My_Union = My_Struct{...}` builds
+				// a My_Struct temporary, and aliasing it as the union would
+				// skip the union-variant store (payload + tag) entirely.
 				if (expr->kind == Ast_CompoundLit &&
-				    inits[i].kind == cgValue_Addr) {
+				    inits[i].kind == cgValue_Addr &&
+				    e != nullptr && are_types_identical(e->type, inits[i].type)) {
 				    	TB_Node *ptr = inits[i].node;
 
 				    	if (e != nullptr && e->token.string.len > 0 && e->token.string != "_") {

@@ -2405,13 +2405,22 @@ gb_internal cgValue cg_emit_conv(cgProcedure *p, cgValue value, Type *t) {
 		}
 	}
 
+	// PATCH(odin-tilde): scalar → array-like splat, port of lb_emit_conv's
+	// is_type_array_like(dst) branch — e.g. `return rune(val), 1, true`
+	// where the first result is [2]rune (core:encoding/entity).
+	if (is_type_array_like(dst) && !is_type_array_like(src)) {
+		Type *elem = base_array_type(dst);
+		i64 count = cast(i64)get_array_type_count(dst);
+		cgValue e = cg_emit_conv(p, value, elem);
+		cgAddr tmp = cg_add_local(p, t, nullptr, false);
+		cgValue base = cg_value(cg_addr_get_ptr(p, tmp).node, alloc_type_pointer(elem));
+		for (i64 i = 0; i < count; i++) {
+			cgValue ep = cg_emit_ptr_offset(p, base, cg_const_int(p, t_int, i));
+			cg_emit_store(p, ep, e);
+		}
+		return cg_addr_load(p, tmp);
+	}
 
-	gb_printf_err("%.*s\n", LIT(p->name));
-	gb_printf_err("cg_emit_conv: src -> dst\n");
-	gb_printf_err("Not Identical %s != %s\n", type_to_string(src_type), type_to_string(t));
-	gb_printf_err("Not Identical %s != %s\n", type_to_string(src), type_to_string(dst));
-	gb_printf_err("Not Identical %p != %p\n", src_type, t);
-	gb_printf_err("Not Identical %p != %p\n", src, dst);
 
 	GB_PANIC("Invalid type conversion: '%s' to '%s' for procedure '%.*s'",
 	         type_to_string(src_type), type_to_string(t),
