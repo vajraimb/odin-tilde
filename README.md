@@ -1,3 +1,10 @@
+> **This is a fork of [odin-lang/Odin](https://github.com/odin-lang/Odin)** (zlib
+> license, © Ginger Bill), modified to add an alternative **tilde (Cuik TB)
+> code-generation backend** alongside the stock LLVM backend. All tilde-specific
+> changes live in `src/tilde*.cpp`, `src/tilde*.hpp`, and `tilde/`.
+> **→ [Beta quickstart & status](tilde/QUICKSTART.md)**
+> Upstream Odin: unchanged license, unmodified documentation below.
+
 <p align="center">
     <img src="misc/logo-slim.png" alt="Odin logo" style="width:65%">
     <br/>
