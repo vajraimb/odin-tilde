@@ -1,0 +1,32 @@
+#!/bin/sh
+# odin-tilde — run the Odin compiler with the tilde (Cuik TB) backend.
+#
+# Coexists peacefully with a stock odin install: for build/run/check/test/doc
+# it appends `-tilde -thread-count:1` (single-threaded builds are byte-for-byte
+# reproducible; multi-threaded builds are nondeterministic due to an upstream
+# checker issue that also affects the LLVM backend). Explicit -llvm / -tilde /
+# -thread-count flags are respected.
+#
+# Install: symlink anywhere on your PATH, e.g.
+#   ln -s /path/to/odin-tilde/tilde/scripts/odin-tilde ~/.local/bin/odin-tilde
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ODIN="$ROOT/odin"
+
+case "$1" in
+  build|run|check|test|doc) ;;
+  *) exec "$ODIN" "$@" ;;
+esac
+
+extra=""
+case " $* " in
+  *" -llvm "*|*" -tilde "*) ;;
+  *) extra="$extra -tilde" ;;
+esac
+case " $* " in
+  *" -thread-count:"*) ;;
+  *) extra="$extra -thread-count:1" ;;
+esac
+
+# Word splitting is intentional: extra only contains fixed flags generated above
+# shellcheck disable=SC2086
+exec "$ODIN" "$@" $extra

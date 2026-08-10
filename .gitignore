@@ -319,3 +319,6 @@ build/
 cmake-build*/
 CMakeLists.txt
 sandbox/
+
+# tilde backend local build artifacts
+tilde/build/
