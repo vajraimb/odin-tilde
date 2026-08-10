@@ -888,6 +888,7 @@ gb_internal String cg_get_entity_name(cgModule *m, Entity *e) {
 }
 
 #include "tilde_const.cpp"
+#include "tilde_abi.cpp"
 #include "tilde_debug.cpp"
 #include "tilde_expr.cpp"
 #include "tilde_builtin.cpp"

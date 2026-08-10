@@ -295,6 +295,13 @@ struct cgModule {
 	// implement atomic fences (TB has no fence node).
 	TB_Global *fence_dummy;
 
+	// NOTE(odin-tilde): lazily created libc memmove extern + prototype used
+	// by cg_builtin_mem_copy (intrinsics.mem_copy is overlap-safe in Odin,
+	// but TB only has a forward memcpy node). Codegen is single-threaded
+	// here, so lazy init needs no lock.
+	TB_Symbol *            libc_memmove_symbol;
+	TB_FunctionPrototype * libc_memmove_proto;
+
 	// NOTE(odin-tilde): Cuik has no Mach-O TLV support, so @(thread_local)
 	// variables are lowered to offsets into a per-thread table fetched via
 	// pthread key (runtime __tilde_tls_base). Offsets are assigned lazily on
@@ -350,6 +357,26 @@ gb_internal bool  cg_global_const_add_region(cgModule *m, ExactValue const &valu
 gb_internal TB_DataType cg_gpr_blob_dt(i64 size);
 gb_internal i64         cg_gpr_blob_capacity(i64 size);
 gb_internal TB_Node *   cg_load_gpr_blob(cgProcedure *p, TB_Node *addr, i64 size, i64 align);
+
+// ------------------------------------------------------------------
+// System-V AMD64 small-aggregate classification for C calling-convention
+// boundaries (tilde_abi.cpp). TB classifies a whole aggregate as a
+// single GPR blob or memory, but SysV splits <= 16-byte composites into
+// per-eightbyte INTEGER/SSE classes riding RAX:RDX / XMM0:XMM1. The
+// C-cc prototype, call site, callee prologue and return emission all
+// consult these helpers so both sides of a C boundary agree.
+// ------------------------------------------------------------------
+struct cgSysVClass {
+	i64  n_chunks;   // 0 => MEMORY class (indirect pointer); 1..2 register chunks
+	bool sse[2];     // per-chunk register class (SSE xmm vs INTEGER gpr)
+	i64  size[2];    // per-chunk byte size (chunk 0 is 8 when n_chunks == 2)
+};
+
+gb_internal bool         cg_sysv_abi_active(void);
+gb_internal cgSysVClass  cg_sysv_classify(Type *type);
+gb_internal bool         cg_sysv_needs_split(Type *type);
+gb_internal TB_DataType  cg_sysv_chunk_dt(cgSysVClass const &sc, int k);
+gb_internal TB_DebugType *cg_sysv_chunk_debug_type(cgModule *m, cgSysVClass const &sc, int k);
 
 gb_internal String cg_get_entity_name(cgModule *m, Entity *e);
 

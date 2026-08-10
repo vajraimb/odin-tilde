@@ -390,10 +390,29 @@ gb_internal TB_DebugType *cg_debug_type_internal(cgModule *m, Type *type) {
 
 			bool is_odin_cc = is_calling_convention_odin(pt->calling_convention);
 
-			if (pt->params) for (Entity *e : pt->params->Tuple.variables) {
-				if (e->kind == Entity_Variable) {
-					param_count += 1;
+			// NOTE(odin-tilde): on SysV AMD64, C-boundary aggregates <= 16
+			// bytes are split into per-eightbyte register chunks (see
+			// tilde_abi.cpp); encode the split directly in the debug func
+			// type so the derived prototype carries one slot per chunk.
+			bool sysv_c_abi = !is_odin_cc && cg_sysv_abi_active();
+
+			if (pt->params) for_array(i, pt->params->Tuple.variables) {
+				Entity *e = pt->params->Tuple.variables[i];
+				if (e->kind != Entity_Variable) {
+					continue;
 				}
+				// NOTE(odin-tilde): the #c_vararg variadic entity is a
+				// placeholder — the individual vararg values are appended
+				// after the fixed parameters at the call site, so it must
+				// keep a single prototype slot (mirrors the call-site guard).
+				bool is_c_vararg_entity = pt->c_vararg && cast(i32)i == pt->variadic_index;
+				if (!is_c_vararg_entity && sysv_c_abi && cg_sysv_needs_split(e->type)) {
+					cgSysVClass sc = cg_sysv_classify(e->type);
+					GB_ASSERT(sc.n_chunks > 0);
+					param_count += sc.n_chunks;
+					continue;
+				}
+				param_count += 1;
 			}
 
 			if (pt->result_count > 0) {
@@ -401,6 +420,10 @@ gb_internal TB_DebugType *cg_debug_type_internal(cgModule *m, Type *type) {
 					// Split returns
 					param_count += pt->result_count-1;
 					return_count = 1;
+				} else if (sysv_c_abi && cg_sysv_needs_split(reduce_tuple_to_single_type(pt->results))) {
+					cgSysVClass sc = cg_sysv_classify(reduce_tuple_to_single_type(pt->results));
+					GB_ASSERT(sc.n_chunks > 0);
+					return_count = sc.n_chunks;
 				} else {
 					return_count = 1;
 				}
@@ -429,18 +452,28 @@ gb_internal TB_DebugType *cg_debug_type_internal(cgModule *m, Type *type) {
 
 			isize param_index = 0;
 			isize return_index = 0;
-			if (pt->params) for (Entity *e : pt->params->Tuple.variables) {
-				if (e->kind == Entity_Variable) {
-					Type *type = e->type;
-					if (is_type_proc(type)) {
-						type = t_rawptr;
-					}
-					String name = e->token.string;
-					if (name.len == 0) {
-						name = str_lit("_");
-					}
-					params[param_index++] = tb_debug_create_field(m->mod, cg_debug_type(m, type), name.len, cast(char const *)name.text, 0);
+			if (pt->params) for_array(i, pt->params->Tuple.variables) {
+				Entity *e = pt->params->Tuple.variables[i];
+				if (e->kind != Entity_Variable) {
+					continue;
 				}
+				bool is_c_vararg_entity = pt->c_vararg && cast(i32)i == pt->variadic_index;
+				Type *type = e->type;
+				if (is_type_proc(type)) {
+					type = t_rawptr;
+				}
+				String name = e->token.string;
+				if (name.len == 0) {
+					name = str_lit("_");
+				}
+				if (!is_c_vararg_entity && sysv_c_abi && cg_sysv_needs_split(type)) {
+					cgSysVClass sc = cg_sysv_classify(type);
+					for (int k = 0; k < sc.n_chunks; k++) {
+						params[param_index++] = tb_debug_create_field(m->mod, cg_sysv_chunk_debug_type(m, sc, k), name.len, cast(char const *)name.text, 0);
+					}
+					continue;
+				}
+				params[param_index++] = tb_debug_create_field(m->mod, cg_debug_type(m, type), name.len, cast(char const *)name.text, 0);
 			}
 
 			if (pt->result_count) {
@@ -469,7 +502,15 @@ gb_internal TB_DebugType *cg_debug_type_internal(cgModule *m, Type *type) {
 					}
 					returns[return_index++] = cg_debug_type(m, last_type);
 				} else {
-					returns[return_index++] = cg_debug_type(m, pt->results);
+					Type *single_result = reduce_tuple_to_single_type(pt->results);
+					if (sysv_c_abi && cg_sysv_needs_split(single_result)) {
+						cgSysVClass sc = cg_sysv_classify(single_result);
+						for (int k = 0; k < sc.n_chunks; k++) {
+							returns[return_index++] = cg_sysv_chunk_debug_type(m, sc, k);
+						}
+					} else {
+						returns[return_index++] = cg_debug_type(m, pt->results);
+					}
 				}
 			}
 

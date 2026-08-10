@@ -1311,7 +1311,13 @@ gb_internal cgValue cg_const_value(cgProcedure *p, Type *type, ExactValue const 
 
 	case ExactValue_String:
 		{
-			GB_ASSERT(is_type_string(type));
+			// NOTE(odin-tilde): a string constant may also be typed []u8
+			// (constant `[]u8("...")` conversion, seen in compress and
+			// sys/posix) — a slice is layout identical to a string
+			// {ptr, len}, so it shares the u8 path below.
+			Type *bt_str = base_type(type);
+			bool is_u8_slice = bt_str->kind == Type_Slice && is_type_u8(core_type(bt_str->Slice.elem));
+			GB_ASSERT(is_type_string(type) || is_u8_slice);
 			cgModule *m = p->module;
 
 			String str = value.value_string;

@@ -361,8 +361,32 @@ gb_internal cgValue cg_builtin_mem_copy(cgProcedure *p, cgValue const &dst, cgVa
 	GB_ASSERT(dst.kind == cgValue_Value);
 	GB_ASSERT(src.kind == cgValue_Value);
 	GB_ASSERT(len.kind == cgValue_Value);
-	// TODO(bill): This needs to be memmove
-	tb_inst_memcpy(p->func, dst.node, src.node, len.node, 1);
+	// NOTE(odin-tilde): Odin's intrinsics.mem_copy is overlap-safe (memmove
+	// semantics); only mem_copy_non_overlapping may assume no overlap. TB's
+	// memcpy node lowers to a forward copy which corrupts overlapping shifts
+	// (e.g. runtime #soa inject_at_elem), so call libc memmove directly.
+	cgModule *m = p->module;
+	if (m->libc_memmove_symbol == nullptr) {
+		m->libc_memmove_symbol = tb_extern_create(m->mod, 7, "memmove", TB_EXTERNAL_SO_LOCAL);
+		TB_PrototypeParam params[3] = {
+			{TB_TYPE_PTR, nullptr, "dst"},
+			{TB_TYPE_PTR, nullptr, "src"},
+			{TB_TYPE_I64, nullptr, "size"},
+		};
+		TB_PrototypeParam rets[1] = {
+			{TB_TYPE_PTR, nullptr, nullptr},
+		};
+		m->libc_memmove_proto = tb_prototype_create(m->mod, TB_CDECL, 3, params, 1, rets, false);
+	}
+	TB_GraphBuilder *g = cg_tb_g(p->func);
+	TB_Node *target = tb_builder_symbol(g, m->libc_memmove_symbol);
+	TB_Node *size = len.node;
+	if (size->dt.type != TB_TAG_I64) {
+		// widen/narrow the length to size_t (I64 on all tilde targets)
+		size = tb_builder_cast(g, TB_TYPE_I64, TB_ZERO_EXT, size);
+	}
+	TB_Node *args[3] = { dst.node, src.node, size };
+	tb_builder_call(g, m->libc_memmove_proto, 0, target, 3, args);
 	return dst;
 }
 
@@ -971,26 +995,65 @@ gb_internal cgValue cg_build_builtin(cgProcedure *p, BuiltinProcId id, Ast *expr
 	case BuiltinProc_DIRECTIVE: {
 		ast_node(bd, BasicDirective, ce->proc);
 		String name = bd->name.string;
-		GB_ASSERT(name == "location");
-		String procedure = p->entity->token.string;
-		TokenPos pos = ast_token(ce->proc).pos;
-		if (ce->args.count > 0) {
-			Ast *ident = unselector_expr(ce->args[0]);
-			GB_ASSERT(ident->kind == Ast_Ident);
-			Entity *e = entity_of_node(ident);
-			GB_ASSERT(e != nullptr);
+		if (name == "location") {
+			String procedure = p->entity->token.string;
+			TokenPos pos = ast_token(ce->proc).pos;
+			if (ce->args.count > 0) {
+				Ast *ident = unselector_expr(ce->args[0]);
+				GB_ASSERT(ident->kind == Ast_Ident);
+				Entity *e = entity_of_node(ident);
+				GB_ASSERT(e != nullptr);
 
-			DeclInfo *decl = e->parent_proc_decl.load();
-			Entity *decl_entity = decl ? decl->entity.load() : nullptr;
-			if (decl_entity != nullptr) {
-				procedure = decl_entity->token.string;
-			} else {
-				procedure = str_lit("");
+				DeclInfo *decl = e->parent_proc_decl.load();
+				Entity *decl_entity = decl ? decl->entity.load() : nullptr;
+				if (decl_entity != nullptr) {
+					procedure = decl_entity->token.string;
+				} else {
+					procedure = str_lit("");
+				}
+				pos = e->token.pos;
+
 			}
-			pos = e->token.pos;
+			return cg_emit_source_code_location_as_global(p, procedure, pos);
+		} else if (name == "load_directory") {
+			// NOTE(odin-tilde): mirrors lb_build_builtin — a private const
+			// global array of Load_Directory_File{name, data}, surfaced as a
+			// []Load_Directory_File slice value
+			cgModule *m = p->module;
+			TEMPORARY_ALLOCATOR_GUARD();
+			LoadDirectoryCache *cache = map_must_get(&m->info->load_directory_map, expr);
+			isize count = cache->files.count;
 
+			Type *elem_type = t_load_directory_file;
+			Type *elem_bt = base_type(elem_type);
+			type_set_offsets(elem_bt);
+			i64 name_offset = elem_bt->Struct.offsets[0];
+			i64 data_offset = elem_bt->Struct.offsets[1];
+			i64 elem_size  = type_size_of(elem_type);
+
+			Type *array_type = alloc_type_array(elem_type, count);
+			String arr_name = cg_generated_name(m, p, "ldd");
+			TB_Global *array_global = tb_global_create(m->mod, arr_name.len, cast(char const *)arr_name.text, cg_debug_type(m, array_type), TB_LINKAGE_PRIVATE);
+			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), array_global, gb_max(type_size_of(array_type), 1), gb_max(type_align_of(array_type), 1), gb_max(4*count, 1));
+
+			for_array(i, cache->files) {
+				LoadFileCache *file = cache->files[i];
+				String file_name = filename_without_directory(file->path);
+				i64 base = cast(i64)i * elem_size;
+				cg_global_const_string(m, file_name, t_string,   array_global, base + name_offset);
+				cg_global_const_string(m, file->data, t_u8_slice, array_global, base + data_offset);
+			}
+
+			// construct the result slice {ptr, len} in a local
+			cgAddr slice_addr = cg_add_local(p, t_load_directory_file_slice, nullptr, false);
+			TB_Node *base = cg_addr_get_ptr(p, slice_addr).node;
+			TB_Node *arr_ptr = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)array_global);
+			tb_inst_store(p->func, TB_TYPE_PTR, base, arr_ptr, 8, false);
+			TB_Node *len_node = tb_inst_uint(p->func, TB_TYPE_INT, count);
+			tb_inst_store(p->func, TB_TYPE_INT, tb_inst_member_access(p->func, base, build_context.int_size), len_node, 8, false);
+			return cg_addr_load(p, slice_addr);
 		}
-		return cg_emit_source_code_location_as_global(p, procedure, pos);
+		GB_PANIC("UNKNOWN DIRECTIVE for tilde backend: %.*s", LIT(name));
 	} break;
 
 	case BuiltinProc_len: {

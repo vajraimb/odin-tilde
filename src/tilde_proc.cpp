@@ -16,6 +16,13 @@ gb_internal i64 cg_gpr_blob_capacity(i64 size) {
 
 gb_internal TB_Node *cg_load_gpr_blob(cgProcedure *p, TB_Node *addr, i64 size, i64 align) {
 	TB_DataType transport = cg_gpr_blob_dt(size);
+	// NOTE(odin-tilde): zero-sized types (empty struct/array fields, e.g. in
+	// flags.parse option structs) classify TB_PASSING_DIRECT with a dummy I8
+	// transport — the callee stores one blob byte into its (clamped 1-byte)
+	// local, so the caller must produce a real node, not a null blob.
+	if (size == 0) {
+		return tb_inst_uint(p->func, transport, 0);
+	}
 	switch (size) {
 	case 1: case 2: case 4: case 8:
 		return tb_inst_load(p->func, transport, addr, cast(TB_CharUnits)align, false);
@@ -330,10 +337,15 @@ gb_internal void cg_procedure_begin(cgProcedure *p) {
 		if (is_odin_like_cc) {
 			result_type = pt->results->Tuple.variables[pt->results->Tuple.variables.count-1]->type;
 		} else {
-			result_type = pt->results;
+			result_type = reduce_tuple_to_single_type(pt->results);
 		}
 		TB_DebugType *debug_type = cg_debug_type(p->module, result_type);
 		TB_PassingRule rule = tb_get_passing_rule_from_dbg(p->module->mod, debug_type, true);
+		if (!is_odin_like_cc && cg_sysv_abi_active() && cg_sysv_needs_split(result_type)) {
+			// NOTE(odin-tilde): SysV splits <= 16-byte C-boundary composites
+			// into register chunks; they are not indirect (see tilde_abi.cpp)
+			rule = TB_PASSING_DIRECT;
+		}
 		if (rule == TB_PASSING_INDIRECT) {
 			p->return_by_ptr = true;
 			param_index++;
@@ -353,8 +365,30 @@ gb_internal void cg_procedure_begin(cgProcedure *p) {
 		TB_CharUnits align = cast(TB_CharUnits)type_align_of(e->type);
 		TB_DebugType *debug_type = cg_debug_type(p->module, e->type);
 		TB_PassingRule rule = tb_get_passing_rule_from_dbg(p->module->mod, debug_type, false);
+		cgSysVClass sysv_sc = {};
+		bool sysv_split = false;
+		if (!is_odin_like_cc && cg_sysv_abi_active() && cg_sysv_needs_split(e->type)) {
+			// NOTE(odin-tilde): SysV per-eightbyte register chunks (tilde_abi.cpp)
+			sysv_sc = cg_sysv_classify(e->type);
+			sysv_split = true;
+			rule = TB_PASSING_DIRECT;
+		}
 		switch (rule) {
 		case TB_PASSING_DIRECT: {
+			if (sysv_split && sysv_sc.n_chunks == 2) {
+				// two register chunks (e.g. complex128 in xmm0:xmm1, u128 in
+				// rdi:rsi): reassemble the aggregate in a callee-owned local
+				param_ptr = tb_inst_local(p->func, size, align);
+				for (int k = 0; k < 2; k++) {
+					TB_Node *chunk = tb_inst_param(p->func, param_index++);
+					TB_Node *dst = tb_inst_member_access(p->func, param_ptr, k*8);
+					tb_inst_store(p->func, chunk->dt, dst, chunk, 1, false);
+				}
+				break;
+			}
+			// NOTE(odin-tilde): a 1-chunk SSE aggregate (e.g. struct{float,float})
+			// arrives as a single F32/F64 node; the plain store below preserves
+			// its bits in the local.
 			TB_Node *param = tb_inst_param(p->func, param_index++);
 			// NOTE(odin-tilde): odd-sized aggregates (3, 5, 6, 7 bytes) arrive
 			// as a transport-width integer blob (I32/I64); the local must be
@@ -793,6 +827,8 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 	bool is_odin_like_cc = is_calling_convention_odin(pt->calling_convention);
 
 	bool return_is_indirect = false;
+	cgSysVClass sysv_return_sc = {};
+	bool sysv_return_split = false;
 
 	Slice<Entity *> result_entities = {};
 	Slice<Entity *> param_entities  = {};
@@ -809,10 +845,16 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 		if (is_odin_like_cc) {
 			return_type = result_entities[result_entities.count-1]->type;
 		} else {
-			return_type = pt->results;
+			return_type = reduce_tuple_to_single_type(pt->results);
 		}
 		TB_DebugType *dbg = cg_debug_type(p->module, return_type);
 		TB_PassingRule rule = tb_get_passing_rule_from_dbg(m, dbg, true);
+		if (!is_odin_like_cc && cg_sysv_abi_active() && cg_sysv_needs_split(return_type)) {
+			// NOTE(odin-tilde): SysV per-eightbyte register chunks (tilde_abi.cpp)
+			sysv_return_sc = cg_sysv_classify(return_type);
+			sysv_return_split = true;
+			rule = TB_PASSING_DIRECT;
+		}
 		if (rule == TB_PASSING_INDIRECT) {
 			return_is_indirect = true;
 			TB_CharUnits size = cast(TB_CharUnits)type_size_of(return_type);
@@ -870,8 +912,29 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 
 		TB_DebugType *dbg = cg_debug_type(p->module, param_type);
 		TB_PassingRule rule = tb_get_passing_rule_from_dbg(m, dbg, false);
+		cgSysVClass sysv_sc = {};
+		bool sysv_split = false;
+		if (!is_odin_like_cc && cg_sysv_abi_active() && !is_c_vararg_arg && cg_sysv_needs_split(param_type)) {
+			// NOTE(odin-tilde): SysV per-eightbyte register chunks (tilde_abi.cpp)
+			sysv_sc = cg_sysv_classify(param_type);
+			sysv_split = true;
+			rule = TB_PASSING_DIRECT;
+		}
 		switch (rule) {
 		case TB_PASSING_DIRECT: {
+			if (sysv_split) {
+				// emit one value per register chunk: SSE chunks are loaded
+				// with a float dt (xmm transport), INTEGER chunks as an
+				// integer blob (gpr transport); bits are preserved either way
+				cgValue arg_ptr = cg_address_from_load_or_generate_local(p, arg);
+				for (int k = 0; k < sysv_sc.n_chunks; k++) {
+					TB_DataType cdt = cg_sysv_chunk_dt(sysv_sc, k);
+					TB_Node *src = tb_inst_member_access(p->func, arg_ptr.node, k*8);
+					TB_Node *chunk = tb_inst_load(p->func, cdt, src, 1, false);
+					params[param_index++] = chunk;
+				}
+				continue;
+			}
 			if (arg.kind != cgValue_Value) {
 				// NOTE(bill): small aggregates (<= 8 bytes on System-V)
 				// are classified TB_PASSING_DIRECT and travel in a single
@@ -946,6 +1009,21 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 	case 0:
 		return {};
 	case 1:
+		if (sysv_return_split && sysv_return_sc.n_chunks == 2) {
+			// NOTE(odin-tilde): two register chunks (e.g. complex128 in
+			// xmm0:xmm1); reassemble the aggregate in a local
+			GB_ASSERT(multi_output.count == 2);
+			Type *rt = pt->results->Tuple.variables[0]->type;
+			TB_CharUnits size  = cast(TB_CharUnits)type_size_of(rt);
+			TB_CharUnits align = cast(TB_CharUnits)type_align_of(rt);
+			TB_Node *addr = tb_inst_local(p->func, size, align);
+			for (int k = 0; k < 2; k++) {
+				TB_Node *chunk = multi_output.multiple[k];
+				TB_Node *dst = tb_inst_member_access(p->func, addr, k*8);
+				tb_inst_store(p->func, chunk->dt, dst, chunk, 1, false);
+			}
+			return cg_lvalue_addr(addr, rt);
+		}
 		if (return_is_indirect) {
 			return cg_lvalue_addr(params[0], pt->results->Tuple.variables[0]->type);
 		} else {

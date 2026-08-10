@@ -1173,6 +1173,16 @@ gb_internal cgValue cg_emit_comp(cgProcedure *p, TokenKind op_kind, cgValue left
 	}
 
 	if (is_type_bit_set(a)) {
+		// NOTE(odin-tilde): u128-backed bit_sets (e.g. bit_set[0..=127]) live in
+		// memory — TB has no native i128, so operands arrive as addresses and the
+		// scalar paths below assert. Route equality through the u128 limb
+		// comparison (testing.expect_value over flags' 128-flag sets hits this).
+		if (type_size_of(bit_set_to_int(a)) == 16) {
+			if (op_kind == Token_CmpEq || op_kind == Token_NotEq) {
+				return cg_emit_comp_u128(p, op_kind, left, right);
+			}
+			GB_PANIC("TODO(tilde): ordering comparisons on u128-backed bit_set (needs 128-bit AND)");
+		}
 		switch (op_kind) {
 		case Token_Lt:
 		case Token_LtEq:
@@ -3025,65 +3035,31 @@ gb_internal cgValue cg_emit_unary_arith(cgProcedure *p, TokenKind op, cgValue x,
 	}
 
 	if (is_type_array_like(x.type)) {
-		GB_PANIC("TODO(bill): cg_emit_unary_arith is_type_array_like");
-		// // IMPORTANT TODO(bill): This is very wasteful with regards to stack memory
-		// Type *tl = base_type(x.type);
-		// cgValue val = cg_address_from_load_or_generate_local(p, x);
-		// GB_ASSERT(is_type_array_like(type));
-		// Type *elem_type = base_array_type(type);
+		// NOTE(odin-tilde): element-wise unary arith on fixed arrays,
+		// unrolled like the array-comparison path (cg_emit_comp)
+		Type *tl = base_type(x.type);
+		cgValue val = cg_address_from_load_or_generate_local(p, x);
+		GB_ASSERT(is_type_array_like(type));
+		Type *elem_type = base_array_type(type);
 
-		// // NOTE(bill): Doesn't need to be zero because it will be initialized in the loops
-		// cgAddr res_addr = cg_add_local(p, type, nullptr, false);
-		// cgValue res = cg_addr_get_ptr(p, res_addr);
+		// NOTE(bill): doesn't need to be zero because every element is
+		// initialized in the loop
+		cgAddr res_addr = cg_add_local(p, type, nullptr, false);
+		cgValue res = cg_addr_get_ptr(p, res_addr);
 
-		// bool inline_array_arith = cg_can_try_to_inline_array_arith(type);
+		i32 count = 0;
+		switch (tl->kind) {
+		case Type_Array:           count = cast(i32)tl->Array.count;           break;
+		case Type_EnumeratedArray: count = cast(i32)tl->EnumeratedArray.count; break;
+		}
+		GB_ASSERT(count > 0);
 
-		// i32 count = cast(i32)get_array_type_count(tl);
-
-		// LLVMTypeRef vector_type = nullptr;
-		// if (op != Token_Not && cg_try_vector_cast(p->module, val, &vector_type)) {
-		// 	LLVMValueRef vp = LLVMBuildPointerCast(p->builder, val.value, LLVMPointerType(vector_type, 0), "");
-		// 	LLVMValueRef v = LLVMBuildLoad2(p->builder, vector_type, vp, "");
-
-		// 	LLVMValueRef opv = nullptr;
-		// 	switch (op) {
-		// 	case Token_Xor:
-		// 		opv = LLVMBuildNot(p->builder, v, "");
-		// 		break;
-		// 	case Token_Sub:
-		// 		if (is_type_float(elem_type)) {
-		// 			opv = LLVMBuildFNeg(p->builder, v, "");
-		// 		} else {
-		// 			opv = LLVMBuildNeg(p->builder, v, "");
-		// 		}
-		// 		break;
-		// 	}
-
-		// 	if (opv != nullptr) {
-		// 		LLVMSetAlignment(res.value, cast(unsigned)cg_alignof(vector_type));
-		// 		LLVMValueRef res_ptr = LLVMBuildPointerCast(p->builder, res.value, LLVMPointerType(vector_type, 0), "");
-		// 		LLVMBuildStore(p->builder, opv, res_ptr);
-		// 		return cg_emit_conv(p, cg_emit_load(p, res), type);
-		// 	}
-		// }
-
-		// if (inline_array_arith) {
-		// 	// inline
-		// 	for (i32 i = 0; i < count; i++) {
-		// 		cgValue e = cg_emit_load(p, cg_emit_array_epi(p, val, i));
-		// 		cgValue z = cg_emit_unary_arith(p, op, e, elem_type);
-		// 		cg_emit_store(p, cg_emit_array_epi(p, res, i), z);
-		// 	}
-		// } else {
-		// 	auto loop_data = cg_loop_start(p, count, t_i32);
-
-		// 	cgValue e = cg_emit_load(p, cg_emit_array_ep(p, val, loop_data.idx));
-		// 	cgValue z = cg_emit_unary_arith(p, op, e, elem_type);
-		// 	cg_emit_store(p, cg_emit_array_ep(p, res, loop_data.idx), z);
-
-		// 	cg_loop_end(p, loop_data);
-		// }
-		// return cg_emit_load(p, res);
+		for (i32 i = 0; i < count; i++) {
+			cgValue e = cg_emit_load(p, cg_emit_array_epi(p, val, i));
+			cgValue z = cg_emit_unary_arith(p, op, e, elem_type);
+			cg_emit_store(p, cg_emit_array_epi(p, res, i), z);
+		}
+		return cg_emit_load(p, res);
 	}
 
 	if (op == Token_Xor) {
