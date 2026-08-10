@@ -170,7 +170,7 @@ gb_internal cgProcedure *cg_procedure_create(cgModule *m, Entity *entity, bool i
 	return p;
 }
 
-gb_internal cgProcedure *cg_procedure_create_dummy(cgModule *m, String const &link_name, Type *type) {
+gb_internal cgProcedure *cg_procedure_create_dummy(cgModule *m, String const &link_name, Type *type, TB_Linkage linkage) {
 	auto *prev_found = string_map_get(&m->members, link_name);
 	GB_ASSERT_MSG(prev_found == nullptr, "failed to create dummy procedure for: %.*s", LIT(link_name));
 
@@ -202,8 +202,11 @@ gb_internal cgProcedure *cg_procedure_create_dummy(cgModule *m, String const &li
 	map_init(&p->variable_map);
 	map_init(&p->soa_values_map);
 
-	TB_Linkage linkage = TB_LINKAGE_PRIVATE;
-
+	// NOTE(new-tb): linkage must be fixed at creation time — TB's symbol hash
+	// set keys PRIVATE symbols by pointer and PUBLIC ones by name, so mutating
+	// linkage after interning corrupts the table (a resize can then visit the
+	// symbol twice, emitting duplicate atoms and tripping ld's
+	// "malformed atom files with duplicate names" assertion).
 	p->func = tb_function_create(m->mod, link_name.len, cast(char const *)link_name.text, linkage);
 
 	p->debug_type = cg_debug_type_for_proc(m, p->type);
@@ -1428,7 +1431,7 @@ gb_internal cgProcedure *cg_equal_proc_for_type(cgModule *m, Type *type) {
 		return *by_name;
 	}
 
-	cgProcedure *p = cg_procedure_create_dummy(m, proc_name, t_equal_proc);
+	cgProcedure *p = cg_procedure_create_dummy(m, proc_name, t_equal_proc, TB_LINKAGE_PRIVATE);
 	string_map_set(&m->generated_procs_by_name, proc_name, p);
 	map_set(&m->equal_procs, type, p);
 	p->split_returns_index = 2;
@@ -1605,7 +1608,7 @@ gb_internal cgProcedure *cg_hasher_proc_for_type(cgModule *m, Type *type) {
 		return *by_name;
 	}
 
-	cgProcedure *p = cg_procedure_create_dummy(m, proc_name, t_hasher_proc);
+	cgProcedure *p = cg_procedure_create_dummy(m, proc_name, t_hasher_proc, TB_LINKAGE_PRIVATE);
 	string_map_set(&m->generated_procs_by_name, proc_name, p);
 	map_set(&m->hasher_procs, type, p);
 	p->split_returns_index = 2;

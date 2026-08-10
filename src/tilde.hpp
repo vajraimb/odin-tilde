@@ -410,6 +410,8 @@ gb_internal TB_DebugType *cg_debug_type(cgModule *m, Type *type);
 
 gb_internal String cg_get_entity_name(cgModule *m, Entity *e);
 
+gb_internal String cg_typed_generated_name(char const *prefix, Type *type);
+
 gb_internal cgValue cg_typeid(cgProcedure *m, Type *t);
 
 gb_internal cgValue cg_emit_ptr_offset(cgProcedure *p, cgValue ptr, cgValue index);

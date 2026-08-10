@@ -1003,12 +1003,10 @@ gb_internal cgProcedure *cg_create_main_procedure(cgModule *m, cgProcedure *star
 		params, params->Tuple.variables.count,
 		results, results->Tuple.variables.count, false, ProcCC_CDecl);
 
-	cgProcedure *p = cg_procedure_create_dummy(m, name, proc_type);
+	// main must be visible to libc — create it PUBLIC from the start (mutating
+	// linkage after tb_function_create corrupts TB's symbol hash set).
+	cgProcedure *p = cg_procedure_create_dummy(m, name, proc_type, TB_LINKAGE_PUBLIC);
 	p->is_startup = true;
-	// dummy procs default to private linkage; main must be visible to libc
-	// (TB_Function is opaque in the public header, but TB_Symbol is its first
-	// member — same cast idiom used throughout the backend).
-	(cast(TB_Symbol *)p->func)->linkage = TB_LINKAGE_PUBLIC;
 
 	// dummy proc has no Ast body; tb_builder_enter applies the prototype
 	// itself, so skip cg_procedure_begin entirely (same idiom as the
@@ -1140,14 +1138,14 @@ gb_internal bool cg_generate_code(Checker *c, LinkerData *linker_data) {
 
 	if (true) {
 		Type *proc_type = alloc_type_proc(nullptr, nullptr, 0, nullptr, 0, false, ProcCC_Odin);
-		cgProcedure *p = cg_procedure_create_dummy(m, str_lit(CG_STARTUP_RUNTIME_PROC_NAME), proc_type);
+		cgProcedure *p = cg_procedure_create_dummy(m, str_lit(CG_STARTUP_RUNTIME_PROC_NAME), proc_type, TB_LINKAGE_PRIVATE);
 		p->is_startup = true;
 		cg_startup_runtime_proc = p;
 	}
 
 	if (true) {
 		Type *proc_type = alloc_type_proc(nullptr, nullptr, 0, nullptr, 0, false, ProcCC_Odin);
-		cgProcedure *p = cg_procedure_create_dummy(m, str_lit(CG_CLEANUP_RUNTIME_PROC_NAME), proc_type);
+		cgProcedure *p = cg_procedure_create_dummy(m, str_lit(CG_CLEANUP_RUNTIME_PROC_NAME), proc_type, TB_LINKAGE_PRIVATE);
 		p->is_startup = true;
 		cg_cleanup_runtime_proc = p;
 	}

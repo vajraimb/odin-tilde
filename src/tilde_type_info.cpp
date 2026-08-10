@@ -563,9 +563,16 @@ gb_internal void cg_setup_type_info_data(cgModule *m) {
 			i64 loc_offset = type_offset_of(tag_type, 3);
 			TokenPos pos = t->Named.type_name->token.pos;
 			// NOTE(odin-tilde): deterministic, position-keyed name — the
-			// declaration position of a named type is unique and stable.
-			char scl_name[48] = {};
-			gb_snprintf(scl_name, 47, "scl$ti$%ux%ux%u", cast(u32)pos.file_id, cast(u32)pos.line, cast(u32)pos.column);
+			// declaration position of a named type is unique and stable,
+			// EXCEPT that polymorphic instantiations (Maybe(int) vs
+			// Maybe(string)) share one declaration site; append the
+			// type-string hash (same scheme as cg_typed_generated_name)
+			// so each instantiation gets a distinct private symbol.
+			char scl_prefix[40] = {};
+			gb_snprintf(scl_prefix, 39, "scl$ti$%ux%ux%u", cast(u32)pos.file_id, cast(u32)pos.line, cast(u32)pos.column);
+			String scl_name_str = cg_typed_generated_name(scl_prefix, t);
+			char scl_name[64] = {};
+			gb_memmove(scl_name, scl_name_str.text, gb_min(scl_name_str.len, 63));
 			TB_Global *scl_global = tb_global_create(m->mod, -1, scl_name, cg_debug_type(m, t_source_code_location), TB_LINKAGE_PRIVATE);
 			tb_global_set_storage(m->mod, tb_module_get_rdata(m->mod), scl_global, type_size_of(t_source_code_location), type_align_of(t_source_code_location), 12);
 			cg_global_source_code_location_const(m, proc_name, pos, scl_global, 0);

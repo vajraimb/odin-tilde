@@ -3190,7 +3190,6 @@ gb_internal void cg_build_mutable_value_decl(cgProcedure *p, Ast *node) {
 
 			TB_DebugType *debug_type = cg_debug_type(m, e->type);
 			TB_Global *global = tb_global_create(m->mod, mangled_name.len, cast(char const *)mangled_name.text, debug_type, TB_LINKAGE_PRIVATE);
-
 			TB_ModuleSectionHandle section = tb_module_get_data(m->mod);
 			if (e->Variable.thread_local_model != "") {
 				section = tb_module_get_tls(m->mod);
@@ -3229,8 +3228,15 @@ gb_internal void cg_build_mutable_value_decl(cgProcedure *p, Ast *node) {
 
 			cg_global_const_add_region(m, value, e->type, global, 0);
 
-			TB_Node *node = tb_inst_get_symbol_address(p->func, cast(TB_Symbol *)global);
-			cgValue global_val = cg_value(node, alloc_type_pointer(e->type));
+			// NOTE(odin-tilde): cache the TB_Symbol, NOT a symbol-address node.
+			// tb_inst_get_symbol_address materializes the node in THIS function's
+			// arena; a nested proc referencing the same @(static) entity would
+			// then inherit a foreign graph node whose death (isel subsume/GVN
+			// dedup) leaves a TB_NULL dangling input in the nested proc's graph
+			// (GCM "dead-input" assert compiling test_core_net@tcp_client-0).
+			// cgValue_Symbol lets every referencing function materialize its own
+			// address node (mirrors how module-level globals are cached).
+			cgValue global_val = cg_value(cast(TB_Symbol *)global, alloc_type_pointer(e->type));
 			cg_add_entity(p->module, e, global_val);
 			cg_add_member(p->module, mangled_name, global_val);
 		}
