@@ -177,6 +177,60 @@ gb_internal cgProcedure *cg_procedure_create(cgModule *m, Entity *entity, bool i
 	return p;
 }
 
+// PATCH(odin-tilde): build a fresh cgProcedure for `entity` reusing an
+// already-reset TB_Function (see tb_function_reset_ir). Used by the RA
+// bail retry: the original symbol stays valid for every call site and
+// call patch, only the emitter state is rebuilt from scratch.
+gb_internal cgProcedure *cg_procedure_recreate(cgModule *m, Entity *entity, TB_Function *reuse_func) {
+	GB_ASSERT(entity != nullptr);
+	GB_ASSERT(entity->kind == Entity_Procedure);
+	GB_ASSERT(reuse_func != nullptr);
+
+	String link_name = cg_get_entity_name(m, entity);
+
+	cgProcedure *p = gb_alloc_item(permanent_allocator(), cgProcedure);
+	p->module = m;
+	p->entity = entity;
+	p->name = link_name;
+
+	DeclInfo *decl = entity->decl_info;
+	ast_node(pl, ProcLit, decl->proc_lit);
+	Type *pt = base_type(entity->type);
+	GB_ASSERT(pt->kind == Type_Proc);
+
+	p->type           = entity->type;
+	p->type_expr      = decl->type_expr;
+	p->body           = pl->body;
+	p->inlining       = pl->inlining;
+	p->is_foreign     = entity->Procedure.is_foreign;
+	p->is_export      = entity->Procedure.is_export;
+	p->is_entry_point = false;
+	p->split_returns_index = -1;
+
+	gbAllocator a = heap_allocator();
+	p->children.allocator      = a;
+	p->defer_stack.allocator   = a;
+	p->scope_stack.allocator   = a;
+	p->context_stack.allocator = a;
+	p->control_regions.allocator = a;
+	p->branch_regions.allocator = a;
+	map_init(&p->variable_map);
+	map_init(&p->soa_values_map);
+
+	p->func  = reuse_func;
+	p->debug_type = cg_debug_type_for_proc(m, p->type);
+	p->proto = tb_prototype_from_dbg(m->mod, p->debug_type);
+	p->symbol = cast(TB_Symbol *)reuse_func;
+	p->value = cg_value(p->symbol, p->type);
+
+	cg_add_symbol(m, entity, p->symbol);
+	cg_add_entity(m, entity, p->value);
+	cg_add_member(m, p->name, p->value);
+	cg_add_procedure_value(m, p);
+
+	return p;
+}
+
 gb_internal cgProcedure *cg_procedure_create_dummy(cgModule *m, String const &link_name, Type *type, TB_Linkage linkage) {
 	auto *prev_found = string_map_get(&m->members, link_name);
 	GB_ASSERT_MSG(prev_found == nullptr, "failed to create dummy procedure for: %.*s", LIT(link_name));
@@ -509,7 +563,13 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 	TB_Worklist *ws = tb_worklist_alloc();
 	defer (tb_worklist_free(ws));
 
+	if (p->force_peeps_only) {
+		tb__set_opt_stage_override(0);
+	}
 	tb_opt_peeps_only(p->func, ws);
+	if (p->force_peeps_only) {
+		tb__set_opt_stage_override(-1);
+	}
 
 	bool emit_asm = false;
 	static gb_thread_local char const *asm_filter = nullptr;
@@ -545,7 +605,29 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 	if (cg_tb_verbose_codegen) {
 		gb_printf_err("[tilde] codegen %.*s\n", LIT(p->name));
 	}
+
+	// PATCH(odin-tilde): Rogers RA can livelock on a coalesced web pinned
+	// across a call (see rogers_ra.c). We arm a per-thread bail handler so a
+	// stuck allocation aborts instead of ICE-ing, then re-emit this function
+	// at opt stage 0 (peeps-only, which compiles fine) via a fresh cgProcedure
+	// that reuses the same TB symbol.
+	jmp_buf ra_bail_jb;
+	tb__ra_bail_push(&ra_bail_jb);
+	if (setjmp(ra_bail_jb) != 0) {
+		tb__ra_bail_pop();
+		if (p->force_peeps_only) {
+			gb_printf_err("[tilde] FATAL: RA bailed on peeps-only recompile of %.*s\n", LIT(p->name));
+			abort();
+		}
+		gb_printf_err("[tilde] RA bail: recompiling %.*s with peeps-only\n", LIT(p->name));
+		tb_function_reset_ir(p->func);
+		cgProcedure *p2 = cg_procedure_recreate(p->module, p->entity, p->func);
+		p2->force_peeps_only = true;
+		cg_procedure_generate(p2);
+		return 0;
+	}
 	TB_FunctionOutput *output = tb_codegen(p->func, TB_RA_ROGERS, ws, cg_arena(), emit_asm);
+	tb__ra_bail_pop();
 	if (emit_asm) {
 		tb_output_print_asm(output, stdout);
 		fprintf(stdout, "\n");

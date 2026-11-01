@@ -819,6 +819,18 @@ TB_API TB_Function* tb_function_create(TB_Module* m, ptrdiff_t len, const char* 
 TB_API void tb_function_set_features(TB_Function* f, const TB_FeatureSet* features);
 TB_API void tb_function_set_attrs(TB_Function* f, TB_FunctionAttribs attrs);
 TB_API void tb_function_destroy(TB_Function* f);
+// PATCH(odin-tilde): reset a function's IR to freshly-initialized state
+// (symbol/prototype preserved) so the driver can re-emit the body after
+// an RA bail.
+TB_API void tb_function_reset_ir(TB_Function* f);
+
+// PATCH(odin-tilde): RA bail channel + per-function optimization stage
+// override (see tb.c). tb__ra_bail_push takes a jmp_buf*.
+TB_API void tb__ra_bail_push(void* jb);
+TB_API void tb__ra_bail_pop(void);
+TB_API bool tb__ra_bail_active(void);
+TB_API void tb__ra_bail(void);
+TB_API void tb__set_opt_stage_override(int stage);
 
 // returns 0 on success
 TB_API int tb_features_parse(TB_FeatureSet* out, TB_Module* m, const char* str);
