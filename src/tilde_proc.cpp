@@ -566,8 +566,60 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 	if (p->force_peeps_only) {
 		tb__set_opt_stage_override(0);
 	}
+	// TEMP DIAG: TILDE_STAGE_FN=<substr> runs the full opt pipeline (env
+	// TB_OPT_STAGE) only on procs whose name matches; everyone else is forced
+	// to stage 0. Used to bisect which proc the stage>=1 miscompile lives in.
+	static gb_thread_local char const *stage_fn_filter = nullptr;
+	static gb_thread_local bool stage_fn_inited = false;
+	static gb_thread_local char const *stage_fn_file = nullptr;
+	static gb_thread_local bool stage_fn_file_inited = false;
+	static gb_thread_local char *stage_fn_file_buf = nullptr;
+	if (!stage_fn_inited) { stage_fn_inited = true; stage_fn_filter = getenv("TILDE_STAGE_FN"); }
+	if (!stage_fn_file_inited) {
+		stage_fn_file_inited = true;
+		stage_fn_file = getenv("TILDE_STAGE_FN_FILE");
+		if (stage_fn_file != nullptr) {
+			FILE *f = fopen(stage_fn_file, "rb");
+			if (f != nullptr) {
+				fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+				stage_fn_file_buf = (char*)malloc(sz + 1);
+				if (fread(stage_fn_file_buf, 1, sz, f) == (size_t)sz) { stage_fn_file_buf[sz] = 0; }
+				else { free(stage_fn_file_buf); stage_fn_file_buf = nullptr; }
+				fclose(f);
+			}
+		}
+	}
+	bool stage_filter_active = (stage_fn_filter != nullptr) || (stage_fn_file_buf != nullptr);
+	if (stage_filter_active) {
+		char namebuf[1024];
+		isize nlen2 = gb_min(cast(isize)p->name.len, cast(isize)gb_size_of(namebuf)-1);
+		gb_memmove(namebuf, p->name.text, nlen2);
+		namebuf[nlen2] = 0;
+		bool match = false;
+		if (stage_fn_filter != nullptr && strstr(namebuf, stage_fn_filter) != nullptr) {
+			match = true;
+		}
+		// TILDE_STAGE_FN_FILE: same semantics, one substring per line (# comments).
+		// Non-destructive scan — the buffer is reused across procs and threads.
+		for (char *lp = stage_fn_file_buf; lp != nullptr && *lp != 0 && !match; ) {
+			char *eol = strchr(lp, '\n');
+			size_t llen = eol ? (size_t)(eol - lp) : strlen(lp);
+			while (llen > 0 && (lp[llen-1] == '\r' || lp[llen-1] == ' ' || lp[llen-1] == '\t')) llen--;
+			if (llen > 0 && lp[0] != '#') {
+				char linebuf[512];
+				size_t cplen = gb_min(llen, gb_size_of(linebuf)-1);
+				gb_memmove(linebuf, lp, cplen);
+				linebuf[cplen] = 0;
+				if (strstr(namebuf, linebuf) != nullptr) match = true;
+			}
+			lp = eol ? eol + 1 : nullptr;
+		}
+		if (!match) {
+			tb__set_opt_stage_override(0);
+		}
+	}
 	tb_opt_peeps_only(p->func, ws);
-	if (p->force_peeps_only) {
+	if (p->force_peeps_only || stage_filter_active) {
 		tb__set_opt_stage_override(-1);
 	}
 
