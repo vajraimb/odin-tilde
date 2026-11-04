@@ -682,7 +682,14 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 		cg_procedure_generate(p2);
 		return 0;
 	}
-	TB_FunctionOutput *output = tb_codegen(p->func, TB_RA_ROGERS, ws, cg_arena(), emit_asm);
+	// odin-tilde: RA 算法可用 TILDE_RA=briggs 切换（a64 上 rogers 对个别
+	// 大函数（fmt@fmt_arg）不收敛时的逃生门；默认 rogers 与 x64 行为一致）
+	static int ra_choice = -1;
+	if (ra_choice < 0) {
+		char const *e = gb_get_env("TILDE_RA", gb_heap_allocator());
+		ra_choice = (e && e[0] == 'b') ? TB_RA_BRIGGS : TB_RA_ROGERS;
+	}
+	TB_FunctionOutput *output = tb_codegen(p->func, (TB_CodegenRA)ra_choice, ws, cg_arena(), emit_asm);
 	tb__ra_bail_pop();
 	if (emit_asm) {
 		tb_output_print_asm(output, stdout);

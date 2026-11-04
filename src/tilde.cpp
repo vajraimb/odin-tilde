@@ -657,7 +657,14 @@ gb_internal cgModule *cg_module_create(Checker *c) {
 	bool is_jit = false;
 	// NOTE(macos): x86_64 + SystemV ABI for darwin_amd64 output (runs under
 	// Rosetta on Apple Silicon). TLS index is a Windows concept — omitted.
-	m->mod = tb_module_create(TB_ARCH_X86_64, TB_SYSTEM_MACOS, is_jit);
+	// odin-tilde: TILDE_ARCH=a64 selects the native AArch64 TB backend for
+	// darwin_arm64 output; anything else keeps the x86_64/Rosetta path.
+	TB_Arch tilde_arch = TB_ARCH_X86_64;
+	char const *tilde_arch_env = getenv("TILDE_ARCH");
+	if (tilde_arch_env && strcmp(tilde_arch_env, "a64") == 0) {
+		tilde_arch = TB_ARCH_AARCH64;
+	}
+	m->mod = tb_module_create(tilde_arch, TB_SYSTEM_MACOS, is_jit);
 	m->fence_dummy = nullptr;
 
 	map_init(&m->values);

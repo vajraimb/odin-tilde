@@ -949,10 +949,14 @@ try_cross_linking:;
 				}
 
 				if (build_context.tilde_backend) {
-					// The Tilde (TB) backend only emits x86-64 machine code. On Apple
-					// Silicon the host clang would otherwise default to arm64 and
-					// reject the object file; the resulting binary runs under Rosetta 2.
-					link_settings = gb_string_appendc(link_settings, "-arch x86_64 ");
+					// The Tilde (TB) backend emits x86-64 machine code by default;
+					// on Apple Silicon the host clang would otherwise default to
+					// arm64 and reject the object file; the resulting binary runs
+					// under Rosetta 2. odin-tilde: TILDE_ARCH=a64 selects the
+					// native AArch64 TB backend, so link for arm64 instead.
+					char const *tilde_arch_env = getenv("TILDE_ARCH");
+					bool tilde_a64 = tilde_arch_env && strcmp(tilde_arch_env, "a64") == 0;
+					link_settings = gb_string_appendc(link_settings, tilde_a64 ? "-arch arm64 " : "-arch x86_64 ");
 				}
 			} else if (build_context.metrics.os == TargetOs_freebsd) {
 				if (build_context.sanitizer_flags & (SanitizerFlag_Address | SanitizerFlag_Memory)) {
@@ -1085,6 +1089,19 @@ try_cross_linking:;
 			// LC_UUID so tilde builds are byte-for-byte reproducible.
 			if (build_context.metrics.os == TargetOs_darwin && build_context.tilde_backend) {
 				pin_darwin_lc_uuid(output_filename);
+			}
+
+			// NOTE(odin-tilde): the UUID pinning above rewrites the file and
+			// invalidates ld's ad-hoc signature; on arm64 dyld refuses to load
+			// such binaries (SIGKILL, Code Signature Invalid). Re-sign ad-hoc.
+			if (build_context.metrics.os == TargetOs_darwin && build_context.tilde_backend) {
+				char const *tilde_arch_env = getenv("TILDE_ARCH");
+				if (tilde_arch_env && strcmp(tilde_arch_env, "a64") == 0) {
+					result = system_exec_command_line_app("codesign", "codesign -s - -f \"%.*s\"", LIT(output_filename));
+					if (result) {
+						return result;
+					}
+				}
 			}
 
 			if (is_osx && build_context.ODIN_DEBUG) {
