@@ -715,6 +715,8 @@ struct TB_FunctionPrototype {
     TB_CallingConv call_conv;
     uint16_t return_count, param_count;
     bool has_varargs;
+    // params[0] is the hidden aggregate-return pointer (AAPCS64 passes it in x8)
+    bool sret;
 
     // params are directly followed by returns
     TB_PrototypeParam params[];

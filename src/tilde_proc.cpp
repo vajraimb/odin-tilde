@@ -429,13 +429,14 @@ gb_internal void cg_procedure_begin(cgProcedure *p) {
 		}
 		switch (rule) {
 		case TB_PASSING_DIRECT: {
-			if (sysv_split && sysv_sc.n_chunks == 2) {
-				// two register chunks (e.g. complex128 in xmm0:xmm1, u128 in
-				// rdi:rsi): reassemble the aggregate in a callee-owned local
-				param_ptr = tb_inst_local(p->func, size, align);
-				for (int k = 0; k < 2; k++) {
+			if (sysv_split && sysv_sc.n_chunks >= 2) {
+				// several register chunks (e.g. complex128 in xmm0:xmm1, u128
+				// in rdi:rsi, an a64 Vector3 HFA in s0-s2): reassemble the
+				// aggregate in a callee-owned local
+				param_ptr = tb_inst_local(p->func, gb_max(size, 16), align);
+				for (int k = 0; k < sysv_sc.n_chunks; k++) {
 					TB_Node *chunk = tb_inst_param(p->func, param_index++);
-					TB_Node *dst = tb_inst_member_access(p->func, param_ptr, k*8);
+					TB_Node *dst = tb_inst_member_access(p->func, param_ptr, sysv_sc.offset[k]);
 					tb_inst_store(p->func, chunk->dt, dst, chunk, 1, false);
 				}
 				break;
@@ -1077,7 +1078,7 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 				cgValue arg_ptr = cg_address_from_load_or_generate_local(p, arg);
 				for (int k = 0; k < sysv_sc.n_chunks; k++) {
 					TB_DataType cdt = cg_sysv_chunk_dt(sysv_sc, k);
-					TB_Node *src = tb_inst_member_access(p->func, arg_ptr.node, k*8);
+					TB_Node *src = tb_inst_member_access(p->func, arg_ptr.node, sysv_sc.offset[k]);
 					TB_Node *chunk = tb_inst_load(p->func, cdt, src, 1, false);
 					params[param_index++] = chunk;
 				}
@@ -1157,17 +1158,18 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 	case 0:
 		return {};
 	case 1:
-		if (sysv_return_split && sysv_return_sc.n_chunks == 2) {
-			// NOTE(odin-tilde): two register chunks (e.g. complex128 in
-			// xmm0:xmm1); reassemble the aggregate in a local
-			GB_ASSERT(multi_output.count == 2);
+		if (sysv_return_split && sysv_return_sc.n_chunks >= 2) {
+			// NOTE(odin-tilde): several register chunks (e.g. complex128 in
+			// xmm0:xmm1, an a64 Vector3 HFA in s0-s2); reassemble the
+			// aggregate in a local
+			GB_ASSERT(multi_output.count == sysv_return_sc.n_chunks);
 			Type *rt = pt->results->Tuple.variables[0]->type;
 			TB_CharUnits size  = cast(TB_CharUnits)type_size_of(rt);
 			TB_CharUnits align = cast(TB_CharUnits)type_align_of(rt);
-			TB_Node *addr = tb_inst_local(p->func, size, align);
-			for (int k = 0; k < 2; k++) {
+			TB_Node *addr = tb_inst_local(p->func, gb_max(size, 16), align);
+			for (int k = 0; k < sysv_return_sc.n_chunks; k++) {
 				TB_Node *chunk = multi_output.multiple[k];
-				TB_Node *dst = tb_inst_member_access(p->func, addr, k*8);
+				TB_Node *dst = tb_inst_member_access(p->func, addr, sysv_return_sc.offset[k]);
 				tb_inst_store(p->func, chunk->dt, dst, chunk, 1, false);
 			}
 			return cg_lvalue_addr(addr, rt);

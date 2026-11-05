@@ -13,8 +13,15 @@
 // ------------------------------------------------------------------
 
 gb_internal bool cg_sysv_abi_active(void) {
-	return build_context.metrics.arch == TargetArch_amd64 &&
-	       build_context.metrics.os  != TargetOs_windows;
+	if (build_context.metrics.os == TargetOs_windows) {
+		return false;
+	}
+	return build_context.metrics.arch == TargetArch_amd64 ||
+	       build_context.metrics.arch == TargetArch_arm64;
+}
+
+gb_internal bool cg_abi_is_aapcs64(void) {
+	return build_context.metrics.arch == TargetArch_arm64;
 }
 
 struct cgSysVLeaf {
@@ -97,7 +104,56 @@ gb_internal void cg_sysv_collect_leaves(Type *type, i64 offset, Array<cgSysVLeaf
 	}
 }
 
+// AAPCS64 (B.2/B.3/B.4, C.2): an HFA is 1-4 float members of one width laid
+// out back to back; it rides one s/d register per member. Anything else
+// <= 16 bytes rides 1-2 GPRs, larger composites are copied and passed (or
+// returned, via x8) by pointer.
+gb_internal cgSysVClass cg_aapcs64_classify(Type *type) {
+	cgSysVClass sc = {};
+
+	Type *bt = base_type(type);
+	i64 size = type_size_of(bt);
+
+	TEMPORARY_ALLOCATOR_GUARD();
+	Array<cgSysVLeaf> leaves = {};
+	leaves.allocator = temporary_allocator();
+	cg_sysv_collect_leaves(bt, 0, leaves);
+
+	bool hfa = leaves.count >= 1 && leaves.count <= 4;
+	for_array(i, leaves) {
+		cgSysVLeaf leaf = leaves[i];
+		if (!leaf.is_float || (leaf.size != 4 && leaf.size != 8) ||
+		    leaf.size != leaves[0].size || leaf.offset != i*leaf.size) {
+			hfa = false;
+			break;
+		}
+	}
+	if (hfa && size == leaves.count*leaves[0].size) {
+		sc.n_chunks = leaves.count;
+		for_array(i, leaves) {
+			sc.sse[i]    = true;
+			sc.size[i]   = leaves[i].size;
+			sc.offset[i] = leaves[i].offset;
+		}
+		return sc;
+	}
+
+	if (size > 16 || size == 0) {
+		sc.n_chunks = 0; // MEMORY
+		return sc;
+	}
+	sc.n_chunks  = size <= 8 ? 1 : 2;
+	sc.size[0]   = gb_min(size, 8);
+	sc.size[1]   = size - 8;
+	sc.offset[1] = 8;
+	return sc;
+}
+
 gb_internal cgSysVClass cg_sysv_classify(Type *type) {
+	if (cg_abi_is_aapcs64()) {
+		return cg_aapcs64_classify(type);
+	}
+
 	cgSysVClass sc = {};
 
 	Type *bt = base_type(type);
@@ -112,9 +168,10 @@ gb_internal cgSysVClass cg_sysv_classify(Type *type) {
 	leaves.allocator = temporary_allocator();
 	cg_sysv_collect_leaves(bt, 0, leaves);
 
-	sc.n_chunks = size <= 8 ? 1 : 2;
-	sc.size[0]  = gb_min(size, 8);
-	sc.size[1]  = size - 8;
+	sc.n_chunks  = size <= 8 ? 1 : 2;
+	sc.size[0]   = gb_min(size, 8);
+	sc.size[1]   = size - 8;
+	sc.offset[1] = 8;
 
 	for (i64 k = 0; k < sc.n_chunks; k++) {
 		i64 lo = k*8;
@@ -148,8 +205,11 @@ gb_internal bool cg_sysv_needs_split(Type *type) {
 	if (is_type_float(type)) {
 		return false; // plain f16/f32/f64 already travel as scalars
 	}
+	if (cg_abi_is_aapcs64() && is_type_simd_vector(type)) {
+		return false; // short vectors keep the existing struct-of-lanes path
+	}
 	cgSysVClass sc = cg_sysv_classify(type);
-	if (sc.n_chunks == 2) {
+	if (sc.n_chunks >= 2) {
 		return true;
 	}
 	return sc.n_chunks == 1 && sc.sse[0];

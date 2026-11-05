@@ -1481,19 +1481,20 @@ gb_internal void cg_build_return_stmt_internal(cgProcedure *p, Slice<cgValue> co
 			Type *rt = tuple->variables[return_count-1]->type;
 			if (cg_sysv_needs_split(rt)) {
 				cgSysVClass sc = cg_sysv_classify(rt);
-				if (sc.n_chunks == 2) {
+				if (sc.n_chunks >= 2) {
 					// NOTE(odin-tilde): SysV returns <= 16-byte composites
-					// as two register chunks (e.g. complex128 -> xmm0:xmm1)
+					// as two register chunks (e.g. complex128 -> xmm0:xmm1);
+					// AAPCS64 HFAs come back in up to four (s0-s3 / d0-d3)
 					cgValue result = cg_flatten_value(p, results[0]);
 					cgValue raddr = cg_address_from_load_or_generate_local(p, result);
-					TB_Node *vals[2] = {};
-					for (int k = 0; k < 2; k++) {
+					TB_Node *vals[4] = {};
+					for (int k = 0; k < sc.n_chunks; k++) {
 						TB_DataType cdt = cg_sysv_chunk_dt(sc, k);
-						TB_Node *src = tb_inst_member_access(p->func, raddr.node, k*8);
+						TB_Node *src = tb_inst_member_access(p->func, raddr.node, sc.offset[k]);
 						vals[k] = tb_inst_load(p->func, cdt, src, 1, false);
 					}
 					cg_emit_defer_stmts(p, cgDeferExit_Return, nullptr);
-					tb_inst_ret(p->func, 2, vals);
+					tb_inst_ret(p->func, cast(int)sc.n_chunks, vals);
 					return;
 				}
 				// NOTE(odin-tilde): a 1-chunk SSE aggregate (e.g.

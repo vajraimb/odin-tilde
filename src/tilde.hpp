@@ -375,10 +375,14 @@ gb_internal TB_Node *   cg_load_gpr_blob(cgProcedure *p, TB_Node *addr, i64 size
 // C-cc prototype, call site, callee prologue and return emission all
 // consult these helpers so both sides of a C boundary agree.
 // ------------------------------------------------------------------
+// On arm64 the same helpers carry the AAPCS64 classification instead: an
+// HFA (1-4 same-width float members) rides one s/d register per member, any
+// other <= 16-byte composite rides 1-2 GPRs, larger ones go indirect.
 struct cgSysVClass {
-	i64  n_chunks;   // 0 => MEMORY class (indirect pointer); 1..2 register chunks
-	bool sse[2];     // per-chunk register class (SSE xmm vs INTEGER gpr)
-	i64  size[2];    // per-chunk byte size (chunk 0 is 8 when n_chunks == 2)
+	i64  n_chunks;   // 0 => MEMORY class (indirect pointer); 1..4 register chunks
+	bool sse[4];     // per-chunk register class (SSE xmm / FPR vs INTEGER gpr)
+	i64  size[4];    // per-chunk byte size
+	i64  offset[4];  // per-chunk byte offset inside the aggregate
 };
 
 gb_internal bool         cg_sysv_abi_active(void);
