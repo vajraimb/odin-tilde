@@ -952,10 +952,9 @@ try_cross_linking:;
 					// The Tilde (TB) backend emits x86-64 machine code by default;
 					// on Apple Silicon the host clang would otherwise default to
 					// arm64 and reject the object file; the resulting binary runs
-					// under Rosetta 2. odin-tilde: TILDE_ARCH=a64 selects the
-					// native AArch64 TB backend, so link for arm64 instead.
-					char const *tilde_arch_env = getenv("TILDE_ARCH");
-					bool tilde_a64 = tilde_arch_env && strcmp(tilde_arch_env, "a64") == 0;
+					// under Rosetta 2. odin-tilde: arm64 targets use the native
+					// AArch64 TB backend, so link for arm64 instead.
+					bool tilde_a64 = build_context.metrics.arch == TargetArch_arm64;
 					link_settings = gb_string_appendc(link_settings, tilde_a64 ? "-arch arm64 " : "-arch x86_64 ");
 				}
 			} else if (build_context.metrics.os == TargetOs_freebsd) {
@@ -1095,8 +1094,7 @@ try_cross_linking:;
 			// invalidates ld's ad-hoc signature; on arm64 dyld refuses to load
 			// such binaries (SIGKILL, Code Signature Invalid). Re-sign ad-hoc.
 			if (build_context.metrics.os == TargetOs_darwin && build_context.tilde_backend) {
-				char const *tilde_arch_env = getenv("TILDE_ARCH");
-				if (tilde_arch_env && strcmp(tilde_arch_env, "a64") == 0) {
+				if (build_context.metrics.arch == TargetArch_arm64) {
 					result = system_exec_command_line_app("codesign", "codesign -s - -f \"%.*s\"", LIT(output_filename));
 					if (result) {
 						return result;

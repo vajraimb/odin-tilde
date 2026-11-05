@@ -4158,15 +4158,22 @@ int main(int arg_count, char const **arg_ptr) {
 			get_fullpath_relative(heap_allocator(), odin_root_dir(), str_lit("shared"), nullptr));
 	}
 
-	// PATCH(odin-tilde): the tilde backend emits x86_64 by default (aarch64
-	// when TILDE_ARCH=a64); when the user did not pick a -target explicitly,
-	// default the frontend target to match the emitted code so that
-	// ODIN_ARCH/build tags line up.
+	// PATCH(odin-tilde): without an explicit -target, the tilde backend emits
+	// for the host arch; TILDE_ARCH=a64 / TILDE_ARCH=x64 overrides it. The
+	// backend and linker follow build_context.metrics.arch from here on.
 	if (build_context.tilde_backend && selected_target_metrics == nullptr) {
 		char const *tilde_arch_env = getenv("TILDE_ARCH");
-		String tilde_target = (tilde_arch_env && strcmp(tilde_arch_env, "a64") == 0)
-			? str_lit("darwin_arm64")
-			: str_lit("darwin_amd64");
+	#if defined(GB_CPU_ARM)
+		bool tilde_a64 = true;
+	#else
+		bool tilde_a64 = false;
+	#endif
+		if (tilde_arch_env && strcmp(tilde_arch_env, "a64") == 0) {
+			tilde_a64 = true;
+		} else if (tilde_arch_env && strcmp(tilde_arch_env, "x64") == 0) {
+			tilde_a64 = false;
+		}
+		String tilde_target = tilde_a64 ? str_lit("darwin_arm64") : str_lit("darwin_amd64");
 		for (isize i = 0; i < gb_count_of(named_targets); i++) {
 			if (str_eq_ignore_case(named_targets[i].name, tilde_target)) {
 				selected_target_metrics = named_targets + i;
