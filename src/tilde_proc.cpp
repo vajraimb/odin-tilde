@@ -604,8 +604,15 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 		gb_memmove(namebuf, p->name.text, nlen2);
 		namebuf[nlen2] = 0;
 		bool match = false;
-		if (stage_fn_filter != nullptr && strstr(namebuf, stage_fn_filter) != nullptr) {
-			match = true;
+		if (stage_fn_filter != nullptr) {
+			// a trailing '$' anchors the match at the end of the name (nested procs share prefixes)
+			size_t flen = strlen(stage_fn_filter);
+			if (flen > 0 && stage_fn_filter[flen-1] == '$') {
+				size_t nl = strlen(namebuf);
+				match = nl >= flen-1 && memcmp(namebuf + nl - (flen-1), stage_fn_filter, flen-1) == 0;
+			} else if (strstr(namebuf, stage_fn_filter) != nullptr) {
+				match = true;
+			}
 		}
 		// TILDE_STAGE_FN_FILE: same semantics, one substring per line (# comments).
 		// Non-destructive scan — the buffer is reused across procs and threads.
