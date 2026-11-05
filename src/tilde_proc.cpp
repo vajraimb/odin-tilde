@@ -552,10 +552,9 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 		isize nlen = gb_min(cast(isize)p->name.len, cast(isize)gb_size_of(namebuf)-1);
 		gb_memmove(namebuf, p->name.text, nlen);
 		namebuf[nlen] = 0;
-		if (strstr(namebuf, ra_dbg_filter) != nullptr) {
-			tb_opt__REGALLOC = true;
-			tb_opt__REGSPLIT = true;
-		}
+		bool on = strstr(namebuf, ra_dbg_filter) != nullptr;
+		tb_opt__REGALLOC = on;
+		tb_opt__REGSPLIT = on;
 	}
 	// TEMP(debug): TILDE_PEEP_TRACE=1 turns on TB's peephole OPTLOG tracing
 	static gb_thread_local bool peep_trace_inited = false;
