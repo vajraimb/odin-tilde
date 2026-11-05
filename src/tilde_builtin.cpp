@@ -369,12 +369,12 @@ gb_internal cgValue cg_builtin_mem_copy(cgProcedure *p, cgValue const &dst, cgVa
 	if (m->libc_memmove_symbol == nullptr) {
 		m->libc_memmove_symbol = tb_extern_create(m->mod, 7, "memmove", TB_EXTERNAL_SO_LOCAL);
 		TB_PrototypeParam params[3] = {
-			{TB_TYPE_PTR, nullptr, "dst"},
-			{TB_TYPE_PTR, nullptr, "src"},
-			{TB_TYPE_I64, nullptr, "size"},
+			{TB_TYPE_PTR, false, nullptr, "dst"},
+			{TB_TYPE_PTR, false, nullptr, "src"},
+			{TB_TYPE_I64, false, nullptr, "size"},
 		};
 		TB_PrototypeParam rets[1] = {
-			{TB_TYPE_PTR, nullptr, nullptr},
+			{TB_TYPE_PTR, false, nullptr, nullptr},
 		};
 		m->libc_memmove_proto = tb_prototype_create(m->mod, TB_CDECL, 3, params, 1, rets, false);
 	}

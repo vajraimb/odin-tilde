@@ -704,6 +704,9 @@ TB_API TB_SourceFile* tb_get_source_file(TB_Module* m, ptrdiff_t len, const char
 ////////////////////////////////
 typedef struct TB_PrototypeParam {
     TB_DataType dt;
+    // always passed in the next outgoing stack slot, even if registers remain
+    // (SysV MEMORY-class aggregates are split into such eightbytes)
+    bool on_stack;
     TB_DebugType* debug_type;
 
     // does not apply for returns

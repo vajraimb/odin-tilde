@@ -406,8 +406,8 @@ gb_internal TB_DebugType *cg_debug_type_internal(cgModule *m, Type *type) {
 				// after the fixed parameters at the call site, so it must
 				// keep a single prototype slot (mirrors the call-site guard).
 				bool is_c_vararg_entity = pt->c_vararg && cast(i32)i == pt->variadic_index;
-				if (!is_c_vararg_entity && sysv_c_abi && cg_sysv_needs_split(e->type)) {
-					cgSysVClass sc = cg_sysv_classify(e->type);
+				if (!is_c_vararg_entity && sysv_c_abi && cg_sysv_needs_split(e->type, true)) {
+					cgSysVClass sc = cg_sysv_classify(e->type, true);
 					GB_ASSERT(sc.n_chunks > 0);
 					param_count += sc.n_chunks;
 					continue;
@@ -466,8 +466,8 @@ gb_internal TB_DebugType *cg_debug_type_internal(cgModule *m, Type *type) {
 				if (name.len == 0) {
 					name = str_lit("_");
 				}
-				if (!is_c_vararg_entity && sysv_c_abi && cg_sysv_needs_split(type)) {
-					cgSysVClass sc = cg_sysv_classify(type);
+				if (!is_c_vararg_entity && sysv_c_abi && cg_sysv_needs_split(type, true)) {
+					cgSysVClass sc = cg_sysv_classify(type, true);
 					for (int k = 0; k < sc.n_chunks; k++) {
 						params[param_index++] = tb_debug_create_field(m->mod, cg_sysv_chunk_debug_type(m, sc, k), name.len, cast(char const *)name.text, 0);
 					}

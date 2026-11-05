@@ -378,16 +378,21 @@ gb_internal TB_Node *   cg_load_gpr_blob(cgProcedure *p, TB_Node *addr, i64 size
 // On arm64 the same helpers carry the AAPCS64 classification instead: an
 // HFA (1-4 same-width float members) rides one s/d register per member, any
 // other <= 16-byte composite rides 1-2 GPRs, larger ones go indirect.
+// SysV AMD64 MEMORY-class parameters (> 16 bytes) are copied by value into
+// the outgoing argument area: they split into `stack` eightbyte chunks that
+// the prototype forces onto the stack (TB_PrototypeParam.on_stack).
+enum { CG_SYSV_MAX_CHUNKS = 64 };
 struct cgSysVClass {
-	i64  n_chunks;   // 0 => MEMORY class (indirect pointer); 1..4 register chunks
-	bool sse[4];     // per-chunk register class (SSE xmm / FPR vs INTEGER gpr)
-	i64  size[4];    // per-chunk byte size
-	i64  offset[4];  // per-chunk byte offset inside the aggregate
+	i64  n_chunks;   // 0 => MEMORY class (indirect pointer); else register/stack chunks
+	bool stack;      // chunks are stack eightbytes rather than registers
+	bool sse[CG_SYSV_MAX_CHUNKS];     // per-chunk register class (SSE xmm / FPR vs INTEGER gpr)
+	i64  size[CG_SYSV_MAX_CHUNKS];    // per-chunk byte size
+	i64  offset[CG_SYSV_MAX_CHUNKS];  // per-chunk byte offset inside the aggregate
 };
 
 gb_internal bool         cg_sysv_abi_active(void);
-gb_internal cgSysVClass  cg_sysv_classify(Type *type);
-gb_internal bool         cg_sysv_needs_split(Type *type);
+gb_internal cgSysVClass  cg_sysv_classify(Type *type, bool is_param = false);
+gb_internal bool         cg_sysv_needs_split(Type *type, bool is_param = false);
 gb_internal TB_DataType  cg_sysv_chunk_dt(cgSysVClass const &sc, int k);
 gb_internal TB_DebugType *cg_sysv_chunk_debug_type(cgModule *m, cgSysVClass const &sc, int k);
 

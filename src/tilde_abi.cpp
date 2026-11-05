@@ -149,7 +149,7 @@ gb_internal cgSysVClass cg_aapcs64_classify(Type *type) {
 	return sc;
 }
 
-gb_internal cgSysVClass cg_sysv_classify(Type *type) {
+gb_internal cgSysVClass cg_sysv_classify(Type *type, bool is_param) {
 	if (cg_abi_is_aapcs64()) {
 		return cg_aapcs64_classify(type);
 	}
@@ -159,7 +159,16 @@ gb_internal cgSysVClass cg_sysv_classify(Type *type) {
 	Type *bt = base_type(type);
 	i64 size = type_size_of(bt);
 	if (size > 16) {
-		sc.n_chunks = 0; // MEMORY
+		// MEMORY: returns go through the hidden pointer; parameters are
+		// copied into the outgoing stack area eightbyte by eightbyte
+		if (is_param && type_align_of(bt) <= 8 && size <= CG_SYSV_MAX_CHUNKS*8) {
+			sc.stack    = true;
+			sc.n_chunks = (size + 7) / 8;
+			for (i64 k = 0; k < sc.n_chunks; k++) {
+				sc.offset[k] = k*8;
+				sc.size[k]   = gb_min(size - k*8, 8);
+			}
+		}
 		return sc;
 	}
 
@@ -201,15 +210,15 @@ gb_internal cgSysVClass cg_sysv_classify(Type *type) {
 	return sc;
 }
 
-gb_internal bool cg_sysv_needs_split(Type *type) {
+gb_internal bool cg_sysv_needs_split(Type *type, bool is_param) {
 	if (is_type_float(type)) {
 		return false; // plain f16/f32/f64 already travel as scalars
 	}
 	if (cg_abi_is_aapcs64() && is_type_simd_vector(type)) {
 		return false; // short vectors keep the existing struct-of-lanes path
 	}
-	cgSysVClass sc = cg_sysv_classify(type);
-	if (sc.n_chunks >= 2) {
+	cgSysVClass sc = cg_sysv_classify(type, is_param);
+	if (sc.n_chunks >= 2 || sc.stack) {
 		return true;
 	}
 	return sc.n_chunks == 1 && sc.sse[0];
@@ -227,5 +236,10 @@ gb_internal TB_DebugType *cg_sysv_chunk_debug_type(cgModule *m, cgSysVClass cons
 		return sc.size[k] <= 4 ? tb_debug_get_float32(m->mod) : tb_debug_get_float64(m->mod);
 	}
 	i64 cap = cg_gpr_blob_capacity(sc.size[k]);
-	return tb_debug_get_integer(m->mod, false, cast(int)(cap*8));
+	TB_DebugType *blob = tb_debug_get_integer(m->mod, false, cast(int)(cap*8));
+	if (sc.stack) {
+		// tb_prototype_from_dbg turns this tag into TB_PrototypeParam.on_stack
+		return tb_debug_create_alias(m->mod, blob, 11, "$sysv_stack");
+	}
+	return blob;
 }

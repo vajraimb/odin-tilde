@@ -421,19 +421,19 @@ gb_internal void cg_procedure_begin(cgProcedure *p) {
 		TB_PassingRule rule = tb_get_passing_rule_from_dbg(p->module->mod, debug_type, false);
 		cgSysVClass sysv_sc = {};
 		bool sysv_split = false;
-		if (!is_odin_like_cc && cg_sysv_abi_active() && cg_sysv_needs_split(e->type)) {
+		if (!is_odin_like_cc && cg_sysv_abi_active() && cg_sysv_needs_split(e->type, true)) {
 			// NOTE(odin-tilde): SysV per-eightbyte register chunks (tilde_abi.cpp)
-			sysv_sc = cg_sysv_classify(e->type);
+			sysv_sc = cg_sysv_classify(e->type, true);
 			sysv_split = true;
 			rule = TB_PASSING_DIRECT;
 		}
 		switch (rule) {
 		case TB_PASSING_DIRECT: {
-			if (sysv_split && sysv_sc.n_chunks >= 2) {
+			if (sysv_split && (sysv_sc.n_chunks >= 2 || sysv_sc.stack)) {
 				// several register chunks (e.g. complex128 in xmm0:xmm1, u128
-				// in rdi:rsi, an a64 Vector3 HFA in s0-s2): reassemble the
-				// aggregate in a callee-owned local
-				param_ptr = tb_inst_local(p->func, gb_max(size, 16), align);
+				// in rdi:rsi, an a64 Vector3 HFA in s0-s2) or SysV stack
+				// eightbytes: reassemble the aggregate in a callee-owned local
+				param_ptr = tb_inst_local(p->func, gb_max(align_formula(size, 8), 16), align);
 				for (int k = 0; k < sysv_sc.n_chunks; k++) {
 					TB_Node *chunk = tb_inst_param(p->func, param_index++);
 					TB_Node *dst = tb_inst_member_access(p->func, param_ptr, sysv_sc.offset[k]);
@@ -1063,9 +1063,9 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 		TB_PassingRule rule = tb_get_passing_rule_from_dbg(m, dbg, false);
 		cgSysVClass sysv_sc = {};
 		bool sysv_split = false;
-		if (!is_odin_like_cc && cg_sysv_abi_active() && !is_c_vararg_arg && cg_sysv_needs_split(param_type)) {
+		if (!is_odin_like_cc && cg_sysv_abi_active() && !is_c_vararg_arg && cg_sysv_needs_split(param_type, true)) {
 			// NOTE(odin-tilde): SysV per-eightbyte register chunks (tilde_abi.cpp)
-			sysv_sc = cg_sysv_classify(param_type);
+			sysv_sc = cg_sysv_classify(param_type, true);
 			sysv_split = true;
 			rule = TB_PASSING_DIRECT;
 		}
@@ -1079,7 +1079,12 @@ gb_internal cgValue cg_emit_call(cgProcedure * p, cgValue value, Slice<cgValue> 
 				for (int k = 0; k < sysv_sc.n_chunks; k++) {
 					TB_DataType cdt = cg_sysv_chunk_dt(sysv_sc, k);
 					TB_Node *src = tb_inst_member_access(p->func, arg_ptr.node, sysv_sc.offset[k]);
-					TB_Node *chunk = tb_inst_load(p->func, cdt, src, 1, false);
+					TB_Node *chunk = nullptr;
+					if (!sysv_sc.sse[k] && cg_gpr_blob_capacity(sysv_sc.size[k]) != sysv_sc.size[k]) {
+						chunk = cg_load_gpr_blob(p, src, sysv_sc.size[k], 1);
+					} else {
+						chunk = tb_inst_load(p->func, cdt, src, 1, false);
+					}
 					params[param_index++] = chunk;
 				}
 				continue;
