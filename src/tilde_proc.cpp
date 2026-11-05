@@ -522,6 +522,7 @@ gb_internal void cg_procedure_begin(cgProcedure *p) {
 extern "C" bool tb_opt__REGALLOC;
 extern "C" bool tb_opt__REGSPLIT;
 extern "C" bool tb_opt__PEEP;
+extern "C" bool tb_opt__SLP;
 extern "C" bool tb_opt_peeps_only(TB_Function *f, TB_Worklist *ws);
 
 gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
@@ -559,6 +560,9 @@ gb_internal WORKER_TASK_PROC(cg_procedure_compile_worker_proc) {
 	// TEMP(debug): TILDE_PEEP_TRACE=1 turns on TB's peephole OPTLOG tracing
 	static gb_thread_local bool peep_trace_inited = false;
 	if (!peep_trace_inited) { peep_trace_inited = true; if (getenv("TILDE_PEEP_TRACE")) tb_opt__PEEP = true; }
+	// TEMP(debug): TILDE_SLP_TRACE=1 turns on TB's SLP debug prints
+	static gb_thread_local bool slp_trace_inited = false;
+	if (!slp_trace_inited) { slp_trace_inited = true; if (getenv("TILDE_SLP_TRACE")) tb_opt__SLP = true; }
 
 	// NOTE(new-tb): the old tb_pass_* driver is gone; optimization is
 	// tb_opt(...) and machine-code emission is tb_codegen(...). We run the
